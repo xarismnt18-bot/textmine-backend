@@ -1,12 +1,9 @@
-torch==2.2.0+cpu --extra-index-url https://download.pytorch.org/whl/cpu
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 python-multipart==0.0.9
 PyPDF2==3.0.1
 openpyxl==3.1.2
 nltk==3.8.1
-numpy==2.1.0
 scikit-learn==1.5.2
 vaderSentiment==3.3.2
-bertopic==0.16.4
-sentence-transformers==3.0.1
+gensim==4.3.2
