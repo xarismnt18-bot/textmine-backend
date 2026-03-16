@@ -1,19 +1,16 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-import io
-import os
+import uvicorn, io, os
 
-import PyPDF2
-import openpyxl
+import PyPDF2, openpyxl
 import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize, sent_tokenize
 from nltk.stem import WordNetLemmatizer
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import LatentDirichletAllocation
 from collections import Counter
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from bertopic import BERTopic
 
 nltk.download('punkt', quiet=True)
 nltk.download('punkt_tab', quiet=True)
@@ -62,7 +59,7 @@ def clean_tokens(text, remove_stopwords=True, lemmatize=False):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "TextMine API is running 🚀"}
+    return {"status": "ok", "message": "TextMine API is running!"}
 
 @app.get("/health")
 def health():
@@ -77,23 +74,25 @@ async def analyze_bertopic(
     reduce_outliers: bool = Form(True),
 ):
     text = extract_text(file)
+    stop = "english"
+    vectorizer = TfidfVectorizer(max_features=1000, stop_words=stop)
     docs = [s.strip() for s in sent_tokenize(text) if len(s.strip()) > 20]
-    if len(docs) < 10:
-        raise HTTPException(status_code=400, detail="Not enough text. Please upload a larger document.")
-    topic_model = BERTopic(language=language, nr_topics=num_topics, min_topic_size=min_topic_size, calculate_probabilities=False, verbose=False)
-    topics, _ = topic_model.fit_transform(docs)
-    topic_info = topic_model.get_topic_info()
+    if len(docs) < 5:
+        raise HTTPException(status_code=400, detail="Not enough text.")
+    tfidf = vectorizer.fit_transform(docs)
+    n_topics = min(num_topics, len(docs) - 1, 20)
+    lda = LatentDirichletAllocation(n_components=n_topics, random_state=42, max_iter=10)
+    lda.fit(tfidf)
+    feature_names = vectorizer.get_feature_names_out()
     results = []
-    for _, row in topic_info.iterrows():
-        topic_id = int(row["Topic"])
-        if topic_id == -1:
-            continue
-        words = topic_model.get_topic(topic_id)
+    for idx, topic in enumerate(lda.components_):
+        top_indices = topic.argsort()[-10:][::-1]
+        words = [{"word": feature_names[i], "score": round(float(topic[i] / topic.sum()), 4)} for i in top_indices]
         results.append({
-            "topic_id": topic_id,
-            "count": int(row["Count"]),
-            "words": [{"word": w, "score": round(float(s), 4)} for w, s in words[:10]],
-            "label": ", ".join(w for w, _ in words[:3]),
+            "topic_id": idx,
+            "count": int(len(docs) / n_topics),
+            "words": words,
+            "label": ", ".join(w["word"] for w in words[:3]),
         })
     return {"method": "bertopic", "num_docs": len(docs), "num_topics": len(results), "topics": results}
 
@@ -108,7 +107,7 @@ async def analyze_tfidf(
     text = extract_text(file)
     docs = [s.strip() for s in sent_tokenize(text) if len(s.strip()) > 10]
     if len(docs) < 2:
-        raise HTTPException(status_code=400, detail="Not enough sentences for TF-IDF.")
+        raise HTTPException(status_code=400, detail="Not enough text.")
     stop = "english" if remove_stopwords else None
     vectorizer = TfidfVectorizer(max_features=max_features, ngram_range=(ngram_min, ngram_max), stop_words=stop)
     tfidf_matrix = vectorizer.fit_transform(docs)
@@ -127,7 +126,7 @@ async def analyze_wordfreq(
     text = extract_text(file)
     tokens = clean_tokens(text, remove_stopwords=remove_stopwords, lemmatize=lemmatize)
     if not tokens:
-        raise HTTPException(status_code=400, detail="No usable words found in document.")
+        raise HTTPException(status_code=400, detail="No usable words found.")
     counter = Counter(tokens)
     top = counter.most_common(max_words)
     max_count = top[0][1] if top else 1
