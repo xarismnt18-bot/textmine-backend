@@ -85,11 +85,6 @@ def preprocess_text(
         stop = set(stopwords.words("english"))
         tokens = [t for t in tokens if t not in stop]
 
-    # Custom stopwords
-    if custom_stopwords.strip():
-        custom = set(w.strip().lower() for w in custom_stopwords.split(",") if w.strip())
-        tokens = [t for t in tokens if t not in custom]
-
     # Min word length filter
     tokens = [t for t in tokens if len(t) >= min_word_len]
 
@@ -100,6 +95,11 @@ def preprocess_text(
     elif stemming:
         stemmer = PorterStemmer()
         tokens = [stemmer.stem(t) for t in tokens]
+
+    # Custom stopwords AFTER lemmatization so lemmatized forms are caught
+    if custom_stopwords.strip():
+        custom = set(w.strip().lower() for w in custom_stopwords.split(",") if w.strip())
+        tokens = [t for t in tokens if t not in custom]
 
     return tokens
 
@@ -252,12 +252,24 @@ async def analyze_lda(
     if len(processed_docs) < 5:
         raise HTTPException(status_code=400, detail="Not enough text after preprocessing.")
 
+    # Build combined stopword list for vectorizer (double-safety net)
+    vectorizer_stop = None
+    if remove_stopwords or custom_stopwords.strip():
+        from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+        combined = set(ENGLISH_STOP_WORDS)
+        if remove_stopwords:
+            combined.update(stopwords.words("english"))
+        if custom_stopwords.strip():
+            combined.update(w.strip().lower() for w in custom_stopwords.split(",") if w.strip())
+        vectorizer_stop = list(combined)
+
     # ── Vectorization ──
     vectorizer = CountVectorizer(
         max_features=max_features,
         min_df=min_df,
         max_df=max_df,
         ngram_range=(ngram_min, ngram_max),
+        stop_words=vectorizer_stop,
     )
     dtm = vectorizer.fit_transform(processed_docs)
 
@@ -589,12 +601,24 @@ async def analyze_coherence(
     if len(processed_docs) < 5:
         raise HTTPException(status_code=400, detail="Not enough text after preprocessing.")
 
+    # Build combined stopword list for vectorizer (double-safety net)
+    coh_vectorizer_stop = None
+    if remove_stopwords or custom_stopwords.strip():
+        from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+        coh_combined = set(ENGLISH_STOP_WORDS)
+        if remove_stopwords:
+            coh_combined.update(stopwords.words("english"))
+        if custom_stopwords.strip():
+            coh_combined.update(w.strip().lower() for w in custom_stopwords.split(",") if w.strip())
+        coh_vectorizer_stop = list(coh_combined)
+
     # Vectorize
     vectorizer = CountVectorizer(
         max_features=max_features,
         min_df=min_df,
         max_df=max_df,
         ngram_range=(ngram_min, ngram_max),
+        stop_words=coh_vectorizer_stop,
     )
     dtm = vectorizer.fit_transform(processed_docs)
     feature_names = vectorizer.get_feature_names_out()
