@@ -7,18 +7,20 @@ import PyPDF2, openpyxl
 import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize, sent_tokenize
-from nltk.stem import WordNetLemmatizer
+from nltk.stem import WordNetLemmatizer, PorterStemmer
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from sklearn.decomposition import LatentDirichletAllocation
 from collections import Counter
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from typing import List, Optional
+import re
 
 nltk.download('punkt', quiet=True)
 nltk.download('punkt_tab', quiet=True)
 nltk.download('stopwords', quiet=True)
 nltk.download('wordnet', quiet=True)
 
-app = FastAPI(title="TextMine API", version="1.0.0")
+app = FastAPI(title="TextMine API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,6 +52,58 @@ def extract_text(file: UploadFile) -> str:
     raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.filename}")
 
 
+def preprocess_text(
+    text: str,
+    remove_sw: bool = True,
+    lemmatize: bool = False,
+    stemming: bool = False,
+    min_word_len: int = 3,
+    custom_stopwords: str = "",
+    remove_numbers: bool = True,
+    lowercase: bool = True,
+) -> List[str]:
+    """
+    Full preprocessing pipeline based on LDA research best practices.
+    Steps: lowercase → remove numbers/punctuation → tokenize →
+           remove stopwords → custom stopwords → min length filter →
+           lemmatize or stem
+    """
+    if lowercase:
+        text = text.lower()
+
+    # Remove numbers and punctuation
+    if remove_numbers:
+        text = re.sub(r'\d+', '', text)
+    text = re.sub(r'[^\w\s]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    # Tokenize
+    tokens = word_tokenize(text)
+
+    # Remove stopwords
+    if remove_sw:
+        stop = set(stopwords.words("english"))
+        tokens = [t for t in tokens if t not in stop]
+
+    # Custom stopwords
+    if custom_stopwords.strip():
+        custom = set(w.strip().lower() for w in custom_stopwords.split(",") if w.strip())
+        tokens = [t for t in tokens if t not in custom]
+
+    # Min word length filter
+    tokens = [t for t in tokens if len(t) >= min_word_len]
+
+    # Lemmatization (preferred over stemming per research)
+    if lemmatize:
+        lem = WordNetLemmatizer()
+        tokens = [lem.lemmatize(t) for t in tokens]
+    elif stemming:
+        stemmer = PorterStemmer()
+        tokens = [stemmer.stem(t) for t in tokens]
+
+    return tokens
+
+
 def clean_tokens(text, remove_stopwords=True, lemmatize=False):
     tokens = word_tokenize(text.lower())
     tokens = [t for t in tokens if t.isalpha() and len(t) > 2]
@@ -70,7 +124,6 @@ def _run_local_bertopic(docs, num_topics, min_topic_size, language, reduce_outli
             status_code=500,
             detail="BERTopic is not installed on this server. Use engine=colab instead.",
         ) from exc
-
     topic_model = BERTopic(
         language=language,
         min_topic_size=min_topic_size,
@@ -82,7 +135,6 @@ def _run_local_bertopic(docs, num_topics, min_topic_size, language, reduce_outli
     if reduce_outliers:
         topics = topic_model.reduce_outliers(docs, topics)
         topic_model.update_topics(docs, topics)
-
     topic_info = topic_model.get_topic_info()
     results = []
     for _, row in topic_info.iterrows():
@@ -103,26 +155,16 @@ def _run_local_bertopic(docs, num_topics, min_topic_size, language, reduce_outli
 def _run_colab_bertopic(docs, num_topics, min_topic_size, language, reduce_outliers):
     colab_url = os.environ.get("COLAB_BERTOPIC_URL")
     if not colab_url:
-        raise HTTPException(
-            status_code=400,
-            detail="COLAB_BERTOPIC_URL is not set. Add it in Render Environment Variables.",
-        )
+        raise HTTPException(status_code=400, detail="COLAB_BERTOPIC_URL is not set.")
     try:
         response = requests.post(
             colab_url,
-            json={
-                "docs": docs,
-                "num_topics": num_topics,
-                "min_topic_size": min_topic_size,
-                "language": language,
-                "reduce_outliers": reduce_outliers,
-            },
+            json={"docs": docs, "num_topics": num_topics, "min_topic_size": min_topic_size, "language": language, "reduce_outliers": reduce_outliers},
             timeout=120,
         )
         response.raise_for_status()
     except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Could not reach Colab BERTopic service: {exc}") from exc
-
+        raise HTTPException(status_code=502, detail=f"Could not reach Colab: {exc}") from exc
     payload = response.json()
     payload.setdefault("engine", "colab")
     payload.setdefault("method", "bertopic")
@@ -133,7 +175,7 @@ def _run_colab_bertopic(docs, num_topics, min_topic_size, language, reduce_outli
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "TextMine API is running!"}
+    return {"status": "ok", "message": "TextMine API is running! 🚀"}
 
 
 @app.get("/health")
@@ -165,16 +207,82 @@ async def analyze_lda(
     num_topics: int = Form(10),
     max_features: int = Form(1000),
     max_iter: int = Form(20),
+    # ── Preprocessing options (research-backed) ──
+    lemmatize: bool = Form(False),
+    stemming: bool = Form(False),
+    remove_stopwords: bool = Form(True),
+    remove_numbers: bool = Form(True),
+    min_word_len: int = Form(3),
+    custom_stopwords: str = Form(""),
+    # ── Vectorizer options ──
+    min_df: int = Form(2),
+    max_df: float = Form(0.95),
+    ngram_min: int = Form(1),
+    ngram_max: int = Form(1),
+    # ── LDA hyperparameters ──
+    alpha: str = Form("auto"),       # 'auto', 'symmetric', or float
+    beta: str = Form("auto"),        # 'auto' or float (learning_offset proxy)
+    learning_method: str = Form("online"),  # 'online' or 'batch'
 ):
     text = extract_text(file)
-    docs = [s.strip() for s in sent_tokenize(text) if len(s.strip()) > 20]
-    if len(docs) < 5:
-        raise HTTPException(status_code=400, detail="Not enough text.")
-    vectorizer = CountVectorizer(max_features=max_features, stop_words="english")
-    dtm = vectorizer.fit_transform(docs)
-    n_topics = min(num_topics, len(docs) - 1)
-    lda = LatentDirichletAllocation(n_components=n_topics, random_state=42, max_iter=max_iter)
+
+    # Split into documents (paragraphs are better than sentences for LDA)
+    raw_docs = [p.strip() for p in text.split('\n') if len(p.strip()) > 30]
+    if len(raw_docs) < 5:
+        raw_docs = [s.strip() for s in sent_tokenize(text) if len(s.strip()) > 20]
+    if len(raw_docs) < 5:
+        raise HTTPException(status_code=400, detail="Not enough text for LDA.")
+
+    # ── Full preprocessing pipeline ──
+    processed_docs = []
+    for doc in raw_docs:
+        tokens = preprocess_text(
+            doc,
+            remove_sw=remove_stopwords,
+            lemmatize=lemmatize,
+            stemming=stemming,
+            min_word_len=min_word_len,
+            custom_stopwords=custom_stopwords,
+            remove_numbers=remove_numbers,
+            lowercase=True,
+        )
+        if tokens:
+            processed_docs.append(" ".join(tokens))
+
+    if len(processed_docs) < 5:
+        raise HTTPException(status_code=400, detail="Not enough text after preprocessing.")
+
+    # ── Vectorization ──
+    vectorizer = CountVectorizer(
+        max_features=max_features,
+        min_df=min_df,
+        max_df=max_df,
+        ngram_range=(ngram_min, ngram_max),
+    )
+    dtm = vectorizer.fit_transform(processed_docs)
+
+    if dtm.shape[1] == 0:
+        raise HTTPException(status_code=400, detail="Vocabulary is empty after preprocessing. Try relaxing the filters.")
+
+    # ── LDA model ──
+    n_topics = min(num_topics, len(processed_docs) - 1, dtm.shape[1])
+
+    # Handle alpha parameter
+    doc_topic_prior = None if alpha == "auto" else (
+        "symmetric" if alpha == "symmetric" else float(alpha)
+    )
+    topic_word_prior = None if beta == "auto" else float(beta)
+
+    lda = LatentDirichletAllocation(
+        n_components=n_topics,
+        random_state=42,
+        max_iter=max_iter,
+        learning_method=learning_method,
+        doc_topic_prior=doc_topic_prior,
+        topic_word_prior=topic_word_prior,
+    )
     lda.fit(dtm)
+
     feature_names = vectorizer.get_feature_names_out()
     results = []
     for idx, topic in enumerate(lda.components_):
@@ -182,11 +290,30 @@ async def analyze_lda(
         words = [{"word": feature_names[i], "score": round(float(topic[i] / topic.sum()), 4)} for i in top_indices]
         results.append({
             "topic_id": idx,
-            "count": int(len(docs) / n_topics),
+            "count": int(len(processed_docs) / n_topics),
             "words": words,
             "label": ", ".join(w["word"] for w in words[:3]),
         })
-    return {"method": "lda", "num_docs": len(docs), "num_topics": len(results), "topics": results}
+
+    return {
+        "method": "lda",
+        "num_docs": len(processed_docs),
+        "num_topics": len(results),
+        "vocab_size": dtm.shape[1],
+        "preprocessing": {
+            "lemmatize": lemmatize,
+            "stemming": stemming,
+            "remove_stopwords": remove_stopwords,
+            "remove_numbers": remove_numbers,
+            "min_word_len": min_word_len,
+            "min_df": min_df,
+            "max_df": max_df,
+            "ngram_range": f"({ngram_min},{ngram_max})",
+            "alpha": alpha,
+            "beta": beta,
+        },
+        "topics": results,
+    }
 
 
 @app.post("/analyze/tfidf")
@@ -207,12 +334,7 @@ async def analyze_tfidf(
     feature_names = vectorizer.get_feature_names_out()
     scores = tfidf_matrix.max(axis=0).toarray().flatten()
     ranked = sorted(zip(feature_names, scores), key=lambda x: x[1], reverse=True)
-    return {
-        "method": "tfidf",
-        "num_docs": len(docs),
-        "num_terms": len(ranked),
-        "terms": [{"word": w, "score": round(float(s), 4)} for w, s in ranked],
-    }
+    return {"method": "tfidf", "num_docs": len(docs), "num_terms": len(ranked), "terms": [{"word": w, "score": round(float(s), 4)} for w, s in ranked]}
 
 
 @app.post("/analyze/wordfreq")
@@ -229,12 +351,7 @@ async def analyze_wordfreq(
     counter = Counter(tokens)
     top = counter.most_common(max_words)
     max_count = top[0][1] if top else 1
-    return {
-        "method": "wordfreq",
-        "total_tokens": len(tokens),
-        "unique_tokens": len(counter),
-        "words": [{"word": w, "count": c, "relative": round(c / max_count, 4)} for w, c in top],
-    }
+    return {"method": "wordfreq", "total_tokens": len(tokens), "unique_tokens": len(counter), "words": [{"word": w, "count": c, "relative": round(c / max_count, 4)} for w, c in top]}
 
 
 @app.post("/analyze/sentiment")
@@ -251,14 +368,7 @@ async def analyze_sentiment(
     for sent in sentences:
         scores = analyzer.polarity_scores(sent)
         label = "positive" if scores["compound"] >= 0.05 else "negative" if scores["compound"] <= -0.05 else "neutral"
-        results.append({
-            "sentence": sent[:200],
-            "compound": round(scores["compound"], 4),
-            "positive": round(scores["pos"], 4),
-            "neutral": round(scores["neu"], 4),
-            "negative": round(scores["neg"], 4),
-            "label": label,
-        })
+        results.append({"sentence": sent[:200], "compound": round(scores["compound"], 4), "positive": round(scores["pos"], 4), "neutral": round(scores["neu"], 4), "negative": round(scores["neg"], 4), "label": label})
     n = len(sentences)
     if n == 0:
         raise HTTPException(status_code=400, detail="No sentences found.")
@@ -273,7 +383,6 @@ async def analyze_sentiment(
     return {"method": "sentiment", "summary": summary, "sentences": results[:100]}
 
 
-# ── Run ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
