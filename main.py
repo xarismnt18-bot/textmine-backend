@@ -402,6 +402,91 @@ async def analyze_tfidf(
     }
 
 
+@app.post("/analyze/tfidf_perdoc")
+async def analyze_tfidf_perdoc(
+    file: UploadFile = File(...),
+    max_features: int = Form(20),
+    ngram_min: int = Form(1),
+    ngram_max: int = Form(2),
+    remove_stopwords: bool = Form(True),
+    lemmatize: bool = Form(False),
+    remove_numbers: bool = Form(True),
+    custom_stopwords: str = Form(""),
+):
+    import numpy as np
+    from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+
+    text = extract_text(file)
+
+    # Split into paragraphs as "documents"
+    paragraphs = [p.strip() for p in text.split('\n') if len(p.strip()) > 50]
+    if len(paragraphs) < 3:
+        paragraphs = [s.strip() for s in sent_tokenize(text) if len(s.strip()) > 30]
+    if len(paragraphs) < 3:
+        raise HTTPException(status_code=400, detail="Not enough text.")
+
+    # Build stopwords
+    combined_stop = set(ENGLISH_STOP_WORDS)
+    if remove_stopwords:
+        combined_stop.update(stopwords.words("english"))
+    if custom_stopwords.strip():
+        combined_stop.update([w.strip().lower() for w in custom_stopwords.split(",") if w.strip()])
+
+    # Preprocess
+    processed = []
+    for p in paragraphs:
+        tokens = preprocess_text(p, remove_sw=remove_stopwords, lemmatize=lemmatize,
+                                  min_word_len=3, custom_stopwords=custom_stopwords,
+                                  remove_numbers=remove_numbers, lowercase=True)
+        if tokens:
+            processed.append(" ".join(tokens))
+
+    if len(processed) < 3:
+        raise HTTPException(status_code=400, detail="Not enough text after preprocessing.")
+
+    # Fit TF-IDF on ALL paragraphs (IDF from full corpus)
+    vectorizer = TfidfVectorizer(
+        max_features=5000,
+        ngram_range=(ngram_min, ngram_max),
+        stop_words=list(combined_stop),
+        sublinear_tf=True,
+        min_df=1,
+        max_df=0.85,
+    )
+    tfidf_matrix = vectorizer.fit_transform(processed)
+    feature_names = vectorizer.get_feature_names_out()
+
+    # Get top terms per paragraph, then aggregate uniqueness
+    # A term is "distinctive" if it scores HIGH in few paragraphs (truly specific)
+    scores_array = tfidf_matrix.toarray()
+
+    # For each term: score = max_score * (1 - frequency_ratio)
+    # This rewards terms that are very high in some docs but not all
+    max_scores = scores_array.max(axis=0)
+    doc_freq = (scores_array > 0).sum(axis=0) / len(processed)
+    distinctiveness = max_scores * (1 - doc_freq * 0.5)
+
+    # Get top N
+    top_idx = distinctiveness.argsort()[-max_features:][::-1]
+
+    # Normalize
+    top_scores = distinctiveness[top_idx]
+    if top_scores.max() > 0:
+        top_scores = top_scores / top_scores.max()
+
+    terms = [{"word": feature_names[i], "score": round(float(top_scores[j]), 4)}
+             for j, i in enumerate(top_idx)]
+    terms.sort(key=lambda x: x["score"], reverse=True)
+
+    return {
+        "method": "tfidf",
+        "num_docs": len(processed),
+        "num_terms": len(terms),
+        "scoring": "distinctiveness (max_score × inverse_frequency)",
+        "terms": terms,
+    }
+
+
 @app.post("/analyze/wordfreq")
 async def analyze_wordfreq(
     file: UploadFile = File(...),
