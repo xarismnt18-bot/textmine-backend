@@ -571,19 +571,18 @@ async def analyze_coherence(
     ngram_max: int = Form(1),
 ):
     import numpy as np
-    from sklearn.model_selection import train_test_split
 
     text = extract_text(file)
 
-    # Split into documents
+    # ── 1. Split into documents ──────────────────────────────────────────────
     raw_docs = [p.strip() for p in text.split('\n') if len(p.strip()) > 30]
     if len(raw_docs) < 5:
         raw_docs = [s.strip() for s in sent_tokenize(text) if len(s.strip()) > 20]
     if len(raw_docs) < 5:
         raise HTTPException(status_code=400, detail="Not enough text.")
 
-    # Preprocessing
-    processed_docs = []
+    # ── 2. Preprocessing — keep token lists (needed for C_V / NPMI) ──────────
+    tokenized_docs = []
     for doc in raw_docs:
         tokens = preprocess_text(
             doc,
@@ -596,15 +595,15 @@ async def analyze_coherence(
             lowercase=True,
         )
         if tokens:
-            processed_docs.append(" ".join(tokens))
+            tokenized_docs.append(tokens)
 
-    if len(processed_docs) < 5:
+    if len(tokenized_docs) < 5:
         raise HTTPException(status_code=400, detail="Not enough text after preprocessing.")
 
-    # Build combined stopword list for vectorizer (double-safety net)
+    # ── 3. Build stopword list for sklearn vectorizer ────────────────────────
+    from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
     coh_vectorizer_stop = None
     if remove_stopwords or custom_stopwords.strip():
-        from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
         coh_combined = set(ENGLISH_STOP_WORDS)
         if remove_stopwords:
             coh_combined.update(stopwords.words("english"))
@@ -612,7 +611,8 @@ async def analyze_coherence(
             coh_combined.update(w.strip().lower() for w in custom_stopwords.split(",") if w.strip())
         coh_vectorizer_stop = list(coh_combined)
 
-    # Vectorize
+    # ── 4. sklearn vectorizer (for LDA + perplexity) ─────────────────────────
+    processed_docs = [" ".join(t) for t in tokenized_docs]
     vectorizer = CountVectorizer(
         max_features=max_features,
         min_df=min_df,
@@ -626,68 +626,147 @@ async def analyze_coherence(
     if dtm.shape[1] == 0:
         raise HTTPException(status_code=400, detail="Vocabulary empty after preprocessing.")
 
-    # Calculate coherence for each number of topics
-    # We use UMass coherence approximation (fast, no extra library needed)
-    # C_v approximation: average top-word co-occurrence across topics
-    results = []
-    topic_range = list(range(min_topics, min(max_topics + 1, len(processed_docs)), step))
+    # ── 5. Attempt Gensim C_V coherence (gold standard) ─────────────────────
+    use_cv = False
+    gensim_dictionary = None
+    gensim_corpus = None
+    try:
+        import gensim
+        import gensim.corpora as corpora
+        from gensim.models import LdaModel
+        from gensim.models.coherencemodel import CoherenceModel
 
-    # Get word co-occurrence matrix for coherence calculation
-    dtm_array = dtm.toarray()
-    doc_count = dtm_array.shape[0]
+        gensim_dictionary = corpora.Dictionary(tokenized_docs)
+        # Filter extremes to match sklearn settings
+        gensim_dictionary.filter_extremes(no_below=min_df, no_above=max_df, keep_n=max_features)
+        gensim_corpus = [gensim_dictionary.doc2bow(doc) for doc in tokenized_docs]
 
-    def umass_coherence(top_words_idx, dtm_arr):
-        """Calculate UMass coherence score for a topic."""
-        scores = []
-        for i in range(1, len(top_words_idx)):
-            for j in range(i):
-                wi = top_words_idx[i]
-                wj = top_words_idx[j]
-                # Co-document frequency
-                co_doc = np.sum((dtm_arr[:, wi] > 0) & (dtm_arr[:, wj] > 0))
-                doc_freq_wj = np.sum(dtm_arr[:, wj] > 0)
-                if doc_freq_wj > 0:
-                    scores.append(np.log((co_doc + 1) / doc_freq_wj))
-        return np.mean(scores) if scores else 0
+        if len(gensim_dictionary) > 0:
+            use_cv = True
+    except ImportError:
+        use_cv = False
 
+    # ── 6. Loop over topic range ─────────────────────────────────────────────
+    topic_range = list(range(min_topics, min(max_topics + 1, len(tokenized_docs)), step))
     perplexity_scores = []
     coherence_scores = []
+    coherence_metric = "c_v" if use_cv else "npmi"
 
     for n_topics in topic_range:
-        lda = LatentDirichletAllocation(
+        # sklearn LDA for perplexity
+        lda_sk = LatentDirichletAllocation(
             n_components=n_topics,
             random_state=42,
             max_iter=max_iter,
             learning_method="online",
         )
-        lda.fit(dtm)
-
-        # Perplexity (lower = better)
-        perp = lda.perplexity(dtm)
+        lda_sk.fit(dtm)
+        perp = lda_sk.perplexity(dtm)
         perplexity_scores.append(round(float(perp), 2))
 
-        # Coherence (higher = better)
-        topic_coherences = []
-        for topic in lda.components_:
-            top_idx = topic.argsort()[-10:][::-1]
-            coh = umass_coherence(top_idx, dtm_array)
-            topic_coherences.append(coh)
-        avg_coherence = round(float(np.mean(topic_coherences)), 4)
-        coherence_scores.append(avg_coherence)
+        if use_cv:
+            # ── Gensim LDA + C_V coherence ────────────────────────────────
+            try:
+                lda_gensim = LdaModel(
+                    corpus=gensim_corpus,
+                    num_topics=n_topics,
+                    id2word=gensim_dictionary,
+                    passes=5,
+                    random_state=42,
+                    alpha="auto",
+                )
+                cm = CoherenceModel(
+                    model=lda_gensim,
+                    texts=tokenized_docs,
+                    dictionary=gensim_dictionary,
+                    coherence="c_v",
+                    topn=10,
+                )
+                score = round(float(cm.get_coherence()), 4)
+            except Exception:
+                # fallback to NPMI if C_V fails
+                try:
+                    cm = CoherenceModel(
+                        model=lda_gensim,
+                        texts=tokenized_docs,
+                        dictionary=gensim_dictionary,
+                        coherence="c_npmi",
+                        topn=10,
+                    )
+                    score = round(float(cm.get_coherence()), 4)
+                    coherence_metric = "npmi"
+                except Exception:
+                    score = 0.0
+        else:
+            # ── NPMI fallback (no gensim) — better than UMass ─────────────
+            # NPMI = log(p(wi,wj) / p(wi)*p(wj)) / -log(p(wi,wj))
+            # computed over sliding windows of size 10
+            window_size = 10
+            all_tokens_flat = [t for doc in tokenized_docs for t in doc]
+            vocab_list = list(feature_names)
+            word2idx = {w: i for i, w in enumerate(vocab_list)}
 
-    # Find optimal: best coherence score
+            # Build co-occurrence counts using sliding windows
+            n_vocab = len(vocab_list)
+            word_count = np.zeros(n_vocab)
+            pair_count = {}
+
+            for doc_tokens in tokenized_docs:
+                idxs = [word2idx[t] for t in doc_tokens if t in word2idx]
+                for k in range(len(idxs)):
+                    word_count[idxs[k]] += 1
+                    window = idxs[max(0, k - window_size): k + window_size + 1]
+                    for m in window:
+                        if m != idxs[k]:
+                            pair = (min(idxs[k], m), max(idxs[k], m))
+                            pair_count[pair] = pair_count.get(pair, 0) + 1
+
+            total = max(sum(word_count), 1)
+
+            def npmi(wi, wj):
+                pair = (min(wi, wj), max(wi, wj))
+                co = pair_count.get(pair, 0)
+                if co == 0:
+                    return -1.0
+                p_wi = word_count[wi] / total
+                p_wj = word_count[wj] / total
+                p_co = co / total
+                pmi = np.log(p_co / (p_wi * p_wj + 1e-12))
+                npmi_val = pmi / (-np.log(p_co + 1e-12))
+                return float(npmi_val)
+
+            topic_scores = []
+            for topic in lda_sk.components_:
+                top_idx = topic.argsort()[-10:][::-1]
+                pairs = [(top_idx[i], top_idx[j])
+                         for i in range(len(top_idx))
+                         for j in range(i + 1, len(top_idx))]
+                s = np.mean([npmi(wi, wj) for wi, wj in pairs]) if pairs else 0.0
+                topic_scores.append(s)
+            score = round(float(np.mean(topic_scores)), 4)
+
+        coherence_scores.append(score)
+
+    # ── 7. Find optimal — peak of C_V/NPMI curve ────────────────────────────
     best_idx = coherence_scores.index(max(coherence_scores))
     optimal_topics = topic_range[best_idx]
 
-    # Normalize coherence for display (0-100 scale)
+    # Normalize for display (0–100)
     min_c = min(coherence_scores)
     max_c = max(coherence_scores)
     range_c = max_c - min_c if max_c != min_c else 1
     normalized = [round((c - min_c) / range_c * 100, 1) for c in coherence_scores]
 
+    metric_label = "C_V (Gensim)" if coherence_metric == "c_v" else "NPMI"
+    recommendation = (
+        f"Based on {metric_label} coherence analysis, {optimal_topics} topics is optimal for your corpus. "
+        f"(Score: {coherence_scores[best_idx]:.4f}, Docs: {len(tokenized_docs)}, Vocab: {dtm.shape[1]} words)"
+    )
+
     return {
         "method": "coherence",
-        "num_docs": len(processed_docs),
+        "coherence_metric": coherence_metric,
+        "num_docs": len(tokenized_docs),
         "vocab_size": dtm.shape[1],
         "topic_range": topic_range,
         "coherence_scores": coherence_scores,
@@ -695,5 +774,5 @@ async def analyze_coherence(
         "perplexity_scores": perplexity_scores,
         "optimal_topics": optimal_topics,
         "optimal_coherence": coherence_scores[best_idx],
-        "recommendation": f"Based on coherence analysis, {optimal_topics} topics is optimal for your corpus.",
+        "recommendation": recommendation,
     }
