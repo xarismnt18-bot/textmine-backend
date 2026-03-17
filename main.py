@@ -127,6 +127,14 @@ def expand_custom_stopwords(custom_stopwords: str, lemmatize: bool = False, stem
     return expanded
 
 
+def _make_tokenizer(stop_set):
+    # Returns a tokenizer that splits on whitespace and filters the given stop set
+    # sklearn silently ignores stop_words= when a custom tokenizer is provided
+    def _tok(x):
+        return [t for t in x.split() if t not in stop_set]
+    return _tok
+
+
 def preprocess_text(
     text: str,
     remove_sw: bool = True,
@@ -380,14 +388,17 @@ async def analyze_lda(
     n_pdocs = len(processed_docs)
     effective_min_df, effective_max_df = adaptive_vectorizer_params(n_pdocs)
 
+    # Build final stop set — sklearn ignores stop_words with custom tokenizer, so filter inside tokenizer
+    final_stop = set(vectorizer_stop) if vectorizer_stop else set()
+    if custom_stopwords.strip():
+        final_stop.update(expand_custom_stopwords(custom_stopwords, lemmatize=lemmatize, stemming=stemming))
+
     vectorizer = CountVectorizer(
         max_features=max_features,
         min_df=effective_min_df,
         max_df=effective_max_df,
         ngram_range=(ngram_min, ngram_max),
-        stop_words=vectorizer_stop,
-        # Use pre-tokenized strings — split on space only, no re-tokenization
-        tokenizer=lambda x: x.split(),
+        tokenizer=_make_tokenizer(final_stop),
         preprocessor=lambda x: x,
         token_pattern=None,
     )
@@ -496,16 +507,19 @@ async def analyze_tfidf(
         combined_stop.update(expand_custom_stopwords(custom_stopwords, lemmatize=lemmatize))
 
     # TF-IDF with proper min/max_df for score differentiation
+    tfidf_stop = set(combined_stop)
+    if custom_stopwords.strip():
+        tfidf_stop.update(expand_custom_stopwords(custom_stopwords, lemmatize=lemmatize))
+
     vectorizer = TfidfVectorizer(
         max_features=max_features,
         ngram_range=(ngram_min, ngram_max),
         min_df=min_df,
         max_df=max_df,
-        stop_words=list(combined_stop),
         sublinear_tf=True,
         use_idf=True,
         smooth_idf=True,
-        tokenizer=lambda x: x.split(),
+        tokenizer=_make_tokenizer(tfidf_stop),
         preprocessor=lambda x: x,
         token_pattern=None,
     )
@@ -766,13 +780,16 @@ async def analyze_coherence(
     # Fully adaptive to corpus size
     effective_min_df, effective_max_df = adaptive_vectorizer_params(n_docs)
 
+    coh_final_stop = set(coh_vectorizer_stop) if coh_vectorizer_stop else set()
+    if custom_stopwords.strip():
+        coh_final_stop.update(expand_custom_stopwords(custom_stopwords, lemmatize=lemmatize, stemming=stemming))
+
     vectorizer = CountVectorizer(
         max_features=max_features,
         min_df=effective_min_df,
         max_df=effective_max_df,
         ngram_range=(ngram_min, ngram_max),
-        stop_words=coh_vectorizer_stop,
-        tokenizer=lambda x: x.split(),
+        tokenizer=_make_tokenizer(coh_final_stop),
         preprocessor=lambda x: x,
         token_pattern=None,
     )
