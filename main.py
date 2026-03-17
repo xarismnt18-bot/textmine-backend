@@ -602,13 +602,44 @@ async def analyze_wordfreq(
 
 @app.post("/analyze/sentiment")
 async def analyze_sentiment(
-    file: UploadFile = File(...),
+    files: List[UploadFile] = File(...),
+    file: Optional[UploadFile] = File(None),
     per_sentence: bool = Form(True),
     model: str = Form("vader"),
 ):
-    text = extract_text(file)
+    # Collect all uploaded files, deduplicate by filename
+    seen = set()
+    all_files = []
+    candidates = list(files or [])
+    if file and getattr(file, 'filename', None):
+        candidates.append(file)
+    for f in candidates:
+        if not f or not getattr(f, 'filename', None):
+            continue
+        if f.filename not in seen:
+            seen.add(f.filename)
+            all_files.append(f)
+
+    if not all_files:
+        raise HTTPException(status_code=400, detail="No files uploaded.")
+
+    # Concatenate text from ALL files
+    full_text = ""
+    for f in all_files:
+        try:
+            if hasattr(f.file, 'seek'):
+                f.file.seek(0)
+            t = extract_text(f).strip()
+            if t:
+                full_text += t + "\n"
+        except Exception:
+            pass
+
+    if not full_text.strip():
+        raise HTTPException(status_code=400, detail="No text could be extracted from the uploaded files.")
+
     analyzer = SentimentIntensityAnalyzer()
-    sentences = sent_tokenize(text) if per_sentence else [text]
+    sentences = sent_tokenize(full_text) if per_sentence else [full_text]
     sentences = [s.strip() for s in sentences if len(s.strip()) > 5]
     results = []
     for sent in sentences:
@@ -626,7 +657,7 @@ async def analyze_sentiment(
         "avg_compound": round(sum(r["compound"] for r in results) / n, 4),
         "model_used": model,
     }
-    return {"method": "sentiment", "summary": summary, "sentences": results[:100]}
+    return {"method": "sentiment", "summary": summary, "sentences": results[:500]}
 
 
 if __name__ == "__main__":
