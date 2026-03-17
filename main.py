@@ -246,15 +246,31 @@ def health():
 
 @app.post("/analyze/bertopic")
 async def analyze_bertopic(
-    file: UploadFile = File(...),
+    files: List[UploadFile] = File(...),
+    file: Optional[UploadFile] = File(None),
     num_topics: int = Form(10),
     min_topic_size: int = Form(15),
     language: str = Form("english"),
     reduce_outliers: bool = Form(True),
     engine: str = Form("local"),
 ):
-    text = extract_text(file)
-    docs = [s.strip() for s in sent_tokenize(text) if len(s.strip()) > 20]
+    # Accept either 'files' (multi) or legacy 'file' (single)
+    seen = set()
+    all_files = []
+    for f in list(files or []) + ([file] if file and getattr(file, 'filename', None) else []):
+        if f and getattr(f, 'filename', None) and f.filename not in seen:
+            seen.add(f.filename)
+            all_files.append(f)
+    if not all_files:
+        raise HTTPException(status_code=400, detail="No files uploaded.")
+    full_text = ""
+    for f in all_files:
+        try:
+            if hasattr(f.file, 'seek'): f.file.seek(0)
+            full_text += extract_text(f) + "\n"
+        except Exception:
+            pass
+    docs = [s.strip() for s in sent_tokenize(full_text) if len(s.strip()) > 20]
     if len(docs) < 5:
         raise HTTPException(status_code=400, detail="Not enough text.")
     if engine == "colab":
