@@ -357,13 +357,23 @@ async def analyze_tfidf(
     if len(processed_docs) < 2:
         raise HTTPException(status_code=400, detail="Not enough text after preprocessing.")
 
+    # Build combined stopwords list: English + custom
+    from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+    combined_stop = set(ENGLISH_STOP_WORDS)
+    if remove_stopwords:
+        combined_stop.update(stopwords.words("english"))
+    if custom_stopwords.strip():
+        custom_list = [w.strip().lower() for w in custom_stopwords.split(",") if w.strip()]
+        combined_stop.update(custom_list)
+
     # TF-IDF with proper min/max_df for score differentiation
     vectorizer = TfidfVectorizer(
         max_features=max_features,
         ngram_range=(ngram_min, ngram_max),
         min_df=min_df,
         max_df=max_df,
-        sublinear_tf=True,  # Apply log normalization to TF — better score distribution
+        stop_words=list(combined_stop),  # Pass ALL stopwords directly to vectorizer
+        sublinear_tf=True,
         use_idf=True,
         smooth_idf=True,
     )
