@@ -1,5 +1,3 @@
-# textmine-backend
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
 diff --git a/README.md b/README.md
 index e556d720706bd07dab451f3600df9626191f73d4..b5586aaad286b21c79b36734403815a75c836d28 100644
 --- a/README.md
@@ -59,6 +57,3 @@ index e556d720706bd07dab451f3600df9626191f73d4..b5586aaad286b21c79b36734403815a7
 +```
 +
 +And return a BERTopic-style payload (topics, counts, top words).
- 
-EOF
-)
