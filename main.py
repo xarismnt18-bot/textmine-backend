@@ -323,18 +323,73 @@ async def analyze_tfidf(
     ngram_min: int = Form(1),
     ngram_max: int = Form(1),
     remove_stopwords: bool = Form(True),
+    min_df: int = Form(2),
+    max_df: float = Form(0.95),
+    lemmatize: bool = Form(False),
+    remove_numbers: bool = Form(True),
+    custom_stopwords: str = Form(""),
 ):
+    import numpy as np
     text = extract_text(file)
-    docs = [s.strip() for s in sent_tokenize(text) if len(s.strip()) > 10]
-    if len(docs) < 2:
+
+    # Use paragraphs as documents for better TF-IDF differentiation
+    raw_docs = [p.strip() for p in text.split('\n') if len(p.strip()) > 30]
+    if len(raw_docs) < 5:
+        raw_docs = [s.strip() for s in sent_tokenize(text) if len(s.strip()) > 20]
+    if len(raw_docs) < 2:
         raise HTTPException(status_code=400, detail="Not enough text.")
-    stop = "english" if remove_stopwords else None
-    vectorizer = TfidfVectorizer(max_features=max_features, ngram_range=(ngram_min, ngram_max), stop_words=stop)
-    tfidf_matrix = vectorizer.fit_transform(docs)
+
+    # Preprocess each document
+    processed_docs = []
+    for doc in raw_docs:
+        tokens = preprocess_text(
+            doc,
+            remove_sw=remove_stopwords,
+            lemmatize=lemmatize,
+            min_word_len=3,
+            custom_stopwords=custom_stopwords,
+            remove_numbers=remove_numbers,
+            lowercase=True,
+        )
+        if tokens:
+            processed_docs.append(" ".join(tokens))
+
+    if len(processed_docs) < 2:
+        raise HTTPException(status_code=400, detail="Not enough text after preprocessing.")
+
+    # TF-IDF with proper min/max_df for score differentiation
+    vectorizer = TfidfVectorizer(
+        max_features=max_features,
+        ngram_range=(ngram_min, ngram_max),
+        min_df=min_df,
+        max_df=max_df,
+        sublinear_tf=True,  # Apply log normalization to TF — better score distribution
+        use_idf=True,
+        smooth_idf=True,
+    )
+    tfidf_matrix = vectorizer.fit_transform(processed_docs)
     feature_names = vectorizer.get_feature_names_out()
-    scores = tfidf_matrix.max(axis=0).toarray().flatten()
+
+    # Use MEAN score across documents (not max) for better differentiation
+    scores_mean = np.asarray(tfidf_matrix.mean(axis=0)).flatten()
+    scores_max = np.asarray(tfidf_matrix.max(axis=0).todense()).flatten()
+
+    # Combine: weighted average of mean and max
+    scores = 0.6 * scores_mean + 0.4 * scores_max
+
+    # Normalize to 0-1
+    if scores.max() > 0:
+        scores = scores / scores.max()
+
     ranked = sorted(zip(feature_names, scores), key=lambda x: x[1], reverse=True)
-    return {"method": "tfidf", "num_docs": len(docs), "num_terms": len(ranked), "terms": [{"word": w, "score": round(float(s), 4)} for w, s in ranked]}
+
+    return {
+        "method": "tfidf",
+        "num_docs": len(processed_docs),
+        "num_terms": len(ranked),
+        "scoring": "sublinear_tf + mean+max weighted",
+        "terms": [{"word": w, "score": round(float(s), 4)} for w, s in ranked],
+    }
 
 
 @app.post("/analyze/wordfreq")
@@ -386,3 +441,140 @@ async def analyze_sentiment(
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+# ── Coherence Score Calculator ────────────────────────────────────────────────
+@app.post("/analyze/coherence")
+async def analyze_coherence(
+    file: UploadFile = File(...),
+    min_topics: int = Form(2),
+    max_topics: int = Form(20),
+    step: int = Form(1),
+    max_features: int = Form(1000),
+    max_iter: int = Form(20),
+    lemmatize: bool = Form(False),
+    stemming: bool = Form(False),
+    remove_stopwords: bool = Form(True),
+    remove_numbers: bool = Form(True),
+    min_word_len: int = Form(3),
+    custom_stopwords: str = Form(""),
+    min_df: int = Form(2),
+    max_df: float = Form(0.95),
+    ngram_min: int = Form(1),
+    ngram_max: int = Form(1),
+):
+    import numpy as np
+    from sklearn.model_selection import train_test_split
+
+    text = extract_text(file)
+
+    # Split into documents
+    raw_docs = [p.strip() for p in text.split('\n') if len(p.strip()) > 30]
+    if len(raw_docs) < 5:
+        raw_docs = [s.strip() for s in sent_tokenize(text) if len(s.strip()) > 20]
+    if len(raw_docs) < 5:
+        raise HTTPException(status_code=400, detail="Not enough text.")
+
+    # Preprocessing
+    processed_docs = []
+    for doc in raw_docs:
+        tokens = preprocess_text(
+            doc,
+            remove_sw=remove_stopwords,
+            lemmatize=lemmatize,
+            stemming=stemming,
+            min_word_len=min_word_len,
+            custom_stopwords=custom_stopwords,
+            remove_numbers=remove_numbers,
+            lowercase=True,
+        )
+        if tokens:
+            processed_docs.append(" ".join(tokens))
+
+    if len(processed_docs) < 5:
+        raise HTTPException(status_code=400, detail="Not enough text after preprocessing.")
+
+    # Vectorize
+    vectorizer = CountVectorizer(
+        max_features=max_features,
+        min_df=min_df,
+        max_df=max_df,
+        ngram_range=(ngram_min, ngram_max),
+    )
+    dtm = vectorizer.fit_transform(processed_docs)
+    feature_names = vectorizer.get_feature_names_out()
+
+    if dtm.shape[1] == 0:
+        raise HTTPException(status_code=400, detail="Vocabulary empty after preprocessing.")
+
+    # Calculate coherence for each number of topics
+    # We use UMass coherence approximation (fast, no extra library needed)
+    # C_v approximation: average top-word co-occurrence across topics
+    results = []
+    topic_range = list(range(min_topics, min(max_topics + 1, len(processed_docs)), step))
+
+    # Get word co-occurrence matrix for coherence calculation
+    dtm_array = dtm.toarray()
+    doc_count = dtm_array.shape[0]
+
+    def umass_coherence(top_words_idx, dtm_arr):
+        """Calculate UMass coherence score for a topic."""
+        scores = []
+        for i in range(1, len(top_words_idx)):
+            for j in range(i):
+                wi = top_words_idx[i]
+                wj = top_words_idx[j]
+                # Co-document frequency
+                co_doc = np.sum((dtm_arr[:, wi] > 0) & (dtm_arr[:, wj] > 0))
+                doc_freq_wj = np.sum(dtm_arr[:, wj] > 0)
+                if doc_freq_wj > 0:
+                    scores.append(np.log((co_doc + 1) / doc_freq_wj))
+        return np.mean(scores) if scores else 0
+
+    perplexity_scores = []
+    coherence_scores = []
+
+    for n_topics in topic_range:
+        lda = LatentDirichletAllocation(
+            n_components=n_topics,
+            random_state=42,
+            max_iter=max_iter,
+            learning_method="online",
+        )
+        lda.fit(dtm)
+
+        # Perplexity (lower = better)
+        perp = lda.perplexity(dtm)
+        perplexity_scores.append(round(float(perp), 2))
+
+        # Coherence (higher = better)
+        topic_coherences = []
+        for topic in lda.components_:
+            top_idx = topic.argsort()[-10:][::-1]
+            coh = umass_coherence(top_idx, dtm_array)
+            topic_coherences.append(coh)
+        avg_coherence = round(float(np.mean(topic_coherences)), 4)
+        coherence_scores.append(avg_coherence)
+
+    # Find optimal: best coherence score
+    best_idx = coherence_scores.index(max(coherence_scores))
+    optimal_topics = topic_range[best_idx]
+
+    # Normalize coherence for display (0-100 scale)
+    min_c = min(coherence_scores)
+    max_c = max(coherence_scores)
+    range_c = max_c - min_c if max_c != min_c else 1
+    normalized = [round((c - min_c) / range_c * 100, 1) for c in coherence_scores]
+
+    return {
+        "method": "coherence",
+        "num_docs": len(processed_docs),
+        "vocab_size": dtm.shape[1],
+        "topic_range": topic_range,
+        "coherence_scores": coherence_scores,
+        "coherence_normalized": normalized,
+        "perplexity_scores": perplexity_scores,
+        "optimal_topics": optimal_topics,
+        "optimal_coherence": coherence_scores[best_idx],
+        "recommendation": f"Based on coherence analysis, {optimal_topics} topics is optimal for your corpus.",
+    }
