@@ -1,8 +1,7 @@
-diff --git a/requirements.txt b/requirements.txt
+a/requirements.txt b/requirements.txt
 index 251986e862c8829200ca924831417cf18604200c..23facbaa17b2663636a23543732d47d3b41c4a63 100644
 --- a/requirements.txt
 +++ b/requirements.txt
-@@ -1,9 +1,12 @@
  fastapi==0.111.0
  uvicorn[standard]==0.29.0
  python-multipart==0.0.9
