@@ -51,6 +51,67 @@ def extract_text(file: UploadFile) -> str:
         return "\n".join(texts)
     raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.filename}")
 
+def extract_texts_as_docs(files_list: list, single_file=None) -> list:
+    """
+    Given a list of UploadFile objects, return one text string per file.
+    If only one file, split it into paragraphs/sentences instead.
+    Handles FastAPI quirks: deduplicates by filename, ignores empty slots.
+    """
+    # Collect all files, deduplicate by filename to avoid double-processing
+    seen = set()
+    all_files = []
+    candidates = list(files_list or [])
+    if single_file and getattr(single_file, 'filename', None):
+        candidates.append(single_file)
+    for f in candidates:
+        if not f or not getattr(f, 'filename', None):
+            continue
+        if f.filename not in seen:
+            seen.add(f.filename)
+            all_files.append(f)
+
+    if len(all_files) > 1:
+        docs = []
+        for f in all_files:
+            try:
+                # Reset file pointer in case it was read already
+                if hasattr(f.file, 'seek'):
+                    f.file.seek(0)
+                t = extract_text(f).strip()
+                if len(t) > 20:
+                    docs.append(t)
+            except Exception:
+                pass
+        return docs
+    elif len(all_files) == 1:
+        if hasattr(all_files[0].file, 'seek'):
+            all_files[0].file.seek(0)
+        text = extract_text(all_files[0])
+        docs = [p.strip() for p in text.split('\n') if len(p.strip()) > 30]
+        if len(docs) < 3:
+            docs = [s.strip() for s in sent_tokenize(text) if len(s.strip()) > 20]
+        return docs
+    return []
+
+
+def adaptive_vectorizer_params(n_docs: int, user_min_df: int = 2, user_max_df: float = 0.95):
+    """
+    Continuously adaptive min_df and max_df — scales smoothly with ANY corpus size.
+
+    min_df = sqrt(n_docs): word must appear in sqrt(n) docs to be statistically meaningful
+      n=3→1, n=5→2, n=10→3, n=30→5, n=100→10, n=154→12, n=500→22
+
+    max_df: logarithmic decay from 0.99 (tiny) to 0.85 (large)
+      n=3→0.99, n=10→0.96, n=50→0.91, n=154→0.88, n=500→0.85
+    """
+    import math
+    if n_docs < 3:
+        return 1, 0.99
+    effective_min_df = max(1, int(math.sqrt(n_docs)))
+    scale = (math.log(n_docs) - math.log(3)) / (math.log(500) - math.log(3))
+    effective_max_df = round(max(0.85, min(0.99, 0.99 - 0.14 * scale)), 2)
+    return effective_min_df, effective_max_df
+
 
 def preprocess_text(
     text: str,
@@ -285,11 +346,14 @@ async def analyze_lda(
             combined.update(w.strip().lower() for w in custom_stopwords.split(",") if w.strip())
         vectorizer_stop = list(combined)
 
-    # ── Vectorization ──
+    # ── Vectorization — fully adaptive to corpus size ──
+    n_pdocs = len(processed_docs)
+    effective_min_df, effective_max_df = adaptive_vectorizer_params(n_pdocs)
+
     vectorizer = CountVectorizer(
         max_features=max_features,
-        min_df=min_df,
-        max_df=max_df,
+        min_df=effective_min_df,
+        max_df=effective_max_df,
         ngram_range=(ngram_min, ngram_max),
         stop_words=vectorizer_stop,
     )
@@ -352,7 +416,8 @@ async def analyze_lda(
 
 @app.post("/analyze/tfidf")
 async def analyze_tfidf(
-    file: UploadFile = File(...),
+    files: List[UploadFile] = File(...),
+    file: Optional[UploadFile] = File(None),
     max_features: int = Form(50),
     ngram_min: int = Form(1),
     ngram_max: int = Form(1),
@@ -364,14 +429,11 @@ async def analyze_tfidf(
     custom_stopwords: str = Form(""),
 ):
     import numpy as np
-    text = extract_text(file)
-
-    # Use paragraphs as documents for better TF-IDF differentiation
-    raw_docs = [p.strip() for p in text.split('\n') if len(p.strip()) > 30]
-    if len(raw_docs) < 5:
-        raw_docs = [s.strip() for s in sent_tokenize(text) if len(s.strip()) > 20]
+    raw_docs = extract_texts_as_docs(files, file)
     if len(raw_docs) < 2:
         raise HTTPException(status_code=400, detail="Not enough text.")
+    # Override user min_df/max_df with adaptive values
+    min_df, max_df = adaptive_vectorizer_params(len(raw_docs))
 
     # Preprocess each document
     processed_docs = []
@@ -438,7 +500,8 @@ async def analyze_tfidf(
 
 @app.post("/analyze/tfidf_perdoc")
 async def analyze_tfidf_perdoc(
-    file: UploadFile = File(...),
+    files: List[UploadFile] = File(...),
+    file: Optional[UploadFile] = File(None),
     max_features: int = Form(20),
     ngram_min: int = Form(1),
     ngram_max: int = Form(2),
@@ -450,12 +513,7 @@ async def analyze_tfidf_perdoc(
     import numpy as np
     from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 
-    text = extract_text(file)
-
-    # Split into paragraphs as "documents"
-    paragraphs = [p.strip() for p in text.split('\n') if len(p.strip()) > 50]
-    if len(paragraphs) < 3:
-        paragraphs = [s.strip() for s in sent_tokenize(text) if len(s.strip()) > 30]
+    paragraphs = extract_texts_as_docs(files, file)
     if len(paragraphs) < 3:
         raise HTTPException(status_code=400, detail="Not enough text.")
 
@@ -478,14 +536,18 @@ async def analyze_tfidf_perdoc(
     if len(processed) < 3:
         raise HTTPException(status_code=400, detail="Not enough text after preprocessing.")
 
-    # Fit TF-IDF on ALL paragraphs (IDF from full corpus)
+    # Fully adaptive to corpus size
+    n_docs = len(processed)
+    auto_min_df, auto_max_df = adaptive_vectorizer_params(n_docs, 1, 0.95)
+
+    # Fit TF-IDF on ALL documents (IDF from full corpus)
     vectorizer = TfidfVectorizer(
         max_features=5000,
         ngram_range=(ngram_min, ngram_max),
         stop_words=list(combined_stop),
         sublinear_tf=True,
-        min_df=1,
-        max_df=0.85,
+        min_df=auto_min_df,
+        max_df=auto_max_df,
     )
     tfidf_matrix = vectorizer.fit_transform(processed)
     feature_names = vectorizer.get_feature_names_out()
@@ -575,7 +637,8 @@ if __name__ == "__main__":
 # ── Coherence Score Calculator ────────────────────────────────────────────────
 @app.post("/analyze/coherence")
 async def analyze_coherence(
-    file: UploadFile = File(...),
+    files: List[UploadFile] = File(...),
+    file: Optional[UploadFile] = File(None),
     min_topics: int = Form(2),
     max_topics: int = Form(20),
     step: int = Form(1),
@@ -594,12 +657,8 @@ async def analyze_coherence(
 ):
     import numpy as np
 
-    text = extract_text(file)
-
     # ── 1. Split into documents ──────────────────────────────────────────────
-    raw_docs = [p.strip() for p in text.split('\n') if len(p.strip()) > 30]
-    if len(raw_docs) < 5:
-        raw_docs = [s.strip() for s in sent_tokenize(text) if len(s.strip()) > 20]
+    raw_docs = extract_texts_as_docs(files, file)
     if len(raw_docs) < 5:
         raise HTTPException(status_code=400, detail="Not enough text.")
 
@@ -635,10 +694,15 @@ async def analyze_coherence(
 
     # ── 4. sklearn vectorizer (for LDA + perplexity) ─────────────────────────
     processed_docs = [" ".join(t) for t in tokenized_docs]
+    n_docs = len(processed_docs)
+
+    # Fully adaptive to corpus size
+    effective_min_df, effective_max_df = adaptive_vectorizer_params(n_docs)
+
     vectorizer = CountVectorizer(
         max_features=max_features,
-        min_df=min_df,
-        max_df=max_df,
+        min_df=effective_min_df,
+        max_df=effective_max_df,
         ngram_range=(ngram_min, ngram_max),
         stop_words=coh_vectorizer_stop,
     )
