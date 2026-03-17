@@ -386,6 +386,10 @@ async def analyze_lda(
         max_df=effective_max_df,
         ngram_range=(ngram_min, ngram_max),
         stop_words=vectorizer_stop,
+        # Use pre-tokenized strings — split on space only, no re-tokenization
+        tokenizer=lambda x: x.split(),
+        preprocessor=lambda x: x,
+        token_pattern=None,
     )
     dtm = vectorizer.fit_transform(processed_docs)
 
@@ -497,10 +501,13 @@ async def analyze_tfidf(
         ngram_range=(ngram_min, ngram_max),
         min_df=min_df,
         max_df=max_df,
-        stop_words=list(combined_stop),  # Pass ALL stopwords directly to vectorizer
+        stop_words=list(combined_stop),
         sublinear_tf=True,
         use_idf=True,
         smooth_idf=True,
+        tokenizer=lambda x: x.split(),
+        preprocessor=lambda x: x,
+        token_pattern=None,
     )
     tfidf_matrix = vectorizer.fit_transform(processed_docs)
     feature_names = vectorizer.get_feature_names_out()
@@ -765,6 +772,9 @@ async def analyze_coherence(
         max_df=effective_max_df,
         ngram_range=(ngram_min, ngram_max),
         stop_words=coh_vectorizer_stop,
+        tokenizer=lambda x: x.split(),
+        preprocessor=lambda x: x,
+        token_pattern=None,
     )
     dtm = vectorizer.fit_transform(processed_docs)
     feature_names = vectorizer.get_feature_names_out()
