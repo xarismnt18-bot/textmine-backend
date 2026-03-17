@@ -113,6 +113,20 @@ def adaptive_vectorizer_params(n_docs: int, user_min_df: int = 2, user_max_df: f
     return effective_min_df, effective_max_df
 
 
+def expand_custom_stopwords(custom_stopwords: str, lemmatize: bool = False, stemming: bool = False) -> set:
+    """Expand custom stopwords to include lemmatized/stemmed forms so they are always caught."""
+    words = set(w.strip().lower() for w in custom_stopwords.split(",") if w.strip())
+    expanded = set(words)
+    if lemmatize:
+        lem = WordNetLemmatizer()
+        expanded.update(lem.lemmatize(w) for w in words)
+        expanded.update(lem.lemmatize(w, pos='v') for w in words)  # verb form
+    if stemming:
+        stemmer = PorterStemmer()
+        expanded.update(stemmer.stem(w) for w in words)
+    return expanded
+
+
 def preprocess_text(
     text: str,
     remove_sw: bool = True,
@@ -157,9 +171,9 @@ def preprocess_text(
         stemmer = PorterStemmer()
         tokens = [stemmer.stem(t) for t in tokens]
 
-    # Custom stopwords AFTER lemmatization so lemmatized forms are caught
+    # Custom stopwords AFTER lemmatization — also matches lemmatized/stemmed forms
     if custom_stopwords.strip():
-        custom = set(w.strip().lower() for w in custom_stopwords.split(",") if w.strip())
+        custom = expand_custom_stopwords(custom_stopwords, lemmatize=lemmatize, stemming=stemming)
         tokens = [t for t in tokens if t not in custom]
 
     return tokens
@@ -359,7 +373,7 @@ async def analyze_lda(
         if remove_stopwords:
             combined.update(stopwords.words("english"))
         if custom_stopwords.strip():
-            combined.update(w.strip().lower() for w in custom_stopwords.split(",") if w.strip())
+            combined.update(expand_custom_stopwords(custom_stopwords, lemmatize=lemmatize, stemming=stemming))
         vectorizer_stop = list(combined)
 
     # ── Vectorization — fully adaptive to corpus size ──
@@ -475,8 +489,7 @@ async def analyze_tfidf(
     if remove_stopwords:
         combined_stop.update(stopwords.words("english"))
     if custom_stopwords.strip():
-        custom_list = [w.strip().lower() for w in custom_stopwords.split(",") if w.strip()]
-        combined_stop.update(custom_list)
+        combined_stop.update(expand_custom_stopwords(custom_stopwords, lemmatize=lemmatize))
 
     # TF-IDF with proper min/max_df for score differentiation
     vectorizer = TfidfVectorizer(
@@ -538,7 +551,7 @@ async def analyze_tfidf_perdoc(
     if remove_stopwords:
         combined_stop.update(stopwords.words("english"))
     if custom_stopwords.strip():
-        combined_stop.update([w.strip().lower() for w in custom_stopwords.split(",") if w.strip()])
+        combined_stop.update(expand_custom_stopwords(custom_stopwords, lemmatize=lemmatize))
 
     # Preprocess
     processed = []
@@ -736,7 +749,7 @@ async def analyze_coherence(
         if remove_stopwords:
             coh_combined.update(stopwords.words("english"))
         if custom_stopwords.strip():
-            coh_combined.update(w.strip().lower() for w in custom_stopwords.split(",") if w.strip())
+            coh_combined.update(expand_custom_stopwords(custom_stopwords, lemmatize=lemmatize, stemming=stemming))
         coh_vectorizer_stop = list(coh_combined)
 
     # ── 4. sklearn vectorizer (for LDA + perplexity) ─────────────────────────
