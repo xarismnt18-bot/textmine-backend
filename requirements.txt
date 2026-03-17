@@ -7,4 +7,4 @@ nltk==3.8.1
 scikit-learn==1.5.2
 vaderSentiment==3.3.2
 requests==2.32.3
-gensim>=4.3.0
+
