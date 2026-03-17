@@ -1,9 +1,17 @@
-fastapi==0.111.0
-uvicorn[standard]==0.29.0
-python-multipart==0.0.9
-PyPDF2==3.0.1
-openpyxl==3.1.2
-nltk==3.8.1
-scikit-learn==1.5.2
-vaderSentiment==3.3.2
-gensim==4.3.2
+diff --git a/requirements.txt b/requirements.txt
+index 251986e862c8829200ca924831417cf18604200c..23facbaa17b2663636a23543732d47d3b41c4a63 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,9 +1,12 @@
+ fastapi==0.111.0
+ uvicorn[standard]==0.29.0
+ python-multipart==0.0.9
+ PyPDF2==3.0.1
+ openpyxl==3.1.2
+ nltk==3.8.1
+ scikit-learn==1.5.2
+ vaderSentiment==3.3.2
+ gensim==4.3.2
++requests==2.32.3
++bertopic==0.16.4
++sentence-transformers==3.0.1
