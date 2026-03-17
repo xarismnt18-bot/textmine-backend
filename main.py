@@ -203,7 +203,8 @@ async def analyze_bertopic(
 
 @app.post("/analyze/lda")
 async def analyze_lda(
-    file: UploadFile = File(...),
+    files: List[UploadFile] = File(...),
+    file: Optional[UploadFile] = File(None),
     num_topics: int = Form(10),
     max_features: int = Form(1000),
     max_iter: int = Form(20),
@@ -224,14 +225,35 @@ async def analyze_lda(
     beta: str = Form("auto"),        # 'auto' or float (learning_offset proxy)
     learning_method: str = Form("online"),  # 'online' or 'batch'
 ):
-    text = extract_text(file)
+    # Support both single file (legacy) and multiple files
+    all_files = []
+    if files:
+        all_files = [f for f in files if f and f.filename]
+    if file and file.filename:
+        all_files.append(file)
+    if not all_files:
+        raise HTTPException(status_code=400, detail="No files uploaded.")
 
-    # Split into documents (paragraphs are better than sentences for LDA)
-    raw_docs = [p.strip() for p in text.split('\n') if len(p.strip()) > 30]
-    if len(raw_docs) < 5:
-        raw_docs = [s.strip() for s in sent_tokenize(text) if len(s.strip()) > 20]
-    if len(raw_docs) < 5:
-        raise HTTPException(status_code=400, detail="Not enough text for LDA.")
+    # If multiple files, each file = one document (best for LDA)
+    # If single file, split by paragraphs/sentences
+    if len(all_files) > 1:
+        raw_docs = []
+        for f in all_files:
+            try:
+                t = extract_text(f).strip()
+                if len(t) > 20:
+                    raw_docs.append(t)
+            except Exception:
+                pass
+        if len(raw_docs) < 3:
+            raise HTTPException(status_code=400, detail="Not enough text across files.")
+    else:
+        text = extract_text(all_files[0])
+        raw_docs = [p.strip() for p in text.split('\n') if len(p.strip()) > 30]
+        if len(raw_docs) < 5:
+            raw_docs = [s.strip() for s in sent_tokenize(text) if len(s.strip()) > 20]
+        if len(raw_docs) < 5:
+            raise HTTPException(status_code=400, detail="Not enough text for LDA.")
 
     # ── Full preprocessing pipeline ──
     processed_docs = []
