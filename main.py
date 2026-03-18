@@ -248,10 +248,9 @@ def _run_colab_bertopic(docs, num_topics, min_topic_size, language, reduce_outli
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"status": "ok", "message": "TextMine API is running! 🚀"}
-
 
 @app.get("/health")
 def health():
