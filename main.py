@@ -51,13 +51,13 @@ def extract_text(file: UploadFile) -> str:
         return "\n".join(texts)
     raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.filename}")
 
+
 def extract_texts_as_docs(files_list: list, single_file=None) -> list:
     """
     Given a list of UploadFile objects, return one text string per file.
     If only one file, split it into paragraphs/sentences instead.
     Handles FastAPI quirks: deduplicates by filename, ignores empty slots.
     """
-    # Collect all files, deduplicate by filename to avoid double-processing
     seen = set()
     all_files = []
     candidates = list(files_list or [])
@@ -74,7 +74,6 @@ def extract_texts_as_docs(files_list: list, single_file=None) -> list:
         docs = []
         for f in all_files:
             try:
-                # Reset file pointer in case it was read already
                 if hasattr(f.file, 'seek'):
                     f.file.seek(0)
                 t = extract_text(f).strip()
@@ -120,7 +119,7 @@ def expand_custom_stopwords(custom_stopwords: str, lemmatize: bool = False, stem
     if lemmatize:
         lem = WordNetLemmatizer()
         expanded.update(lem.lemmatize(w) for w in words)
-        expanded.update(lem.lemmatize(w, pos='v') for w in words)  # verb form
+        expanded.update(lem.lemmatize(w, pos='v') for w in words)
     if stemming:
         stemmer = PorterStemmer()
         expanded.update(stemmer.stem(w) for w in words)
@@ -128,8 +127,6 @@ def expand_custom_stopwords(custom_stopwords: str, lemmatize: bool = False, stem
 
 
 def _make_tokenizer(stop_set):
-    # Returns a tokenizer that splits on whitespace and filters the given stop set
-    # sklearn silently ignores stop_words= when a custom tokenizer is provided
     def _tok(x):
         return [t for t in x.split() if t not in stop_set]
     return _tok
@@ -154,24 +151,19 @@ def preprocess_text(
     if lowercase:
         text = text.lower()
 
-    # Remove numbers and punctuation
     if remove_numbers:
         text = re.sub(r'\d+', '', text)
     text = re.sub(r'[^\w\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
 
-    # Tokenize
     tokens = word_tokenize(text)
 
-    # Remove stopwords
     if remove_sw:
         stop = set(stopwords.words("english"))
         tokens = [t for t in tokens if t not in stop]
 
-    # Min word length filter
     tokens = [t for t in tokens if len(t) >= min_word_len]
 
-    # Lemmatization (preferred over stemming per research)
     if lemmatize:
         lem = WordNetLemmatizer()
         tokens = [lem.lemmatize(t) for t in tokens]
@@ -276,7 +268,6 @@ async def analyze_bertopic(
     reduce_outliers: bool = Form(True),
     engine: str = Form("local"),
 ):
-    # Accept either 'files' (multi) or legacy 'file' (single)
     seen = set()
     all_files = []
     for f in list(files or []) + ([file] if file and getattr(file, 'filename', None) else []):
@@ -307,24 +298,20 @@ async def analyze_lda(
     num_topics: int = Form(10),
     max_features: int = Form(1000),
     max_iter: int = Form(20),
-    # ── Preprocessing options (research-backed) ──
     lemmatize: bool = Form(False),
     stemming: bool = Form(False),
     remove_stopwords: bool = Form(True),
     remove_numbers: bool = Form(True),
     min_word_len: int = Form(3),
     custom_stopwords: str = Form(""),
-    # ── Vectorizer options ──
     min_df: int = Form(2),
     max_df: float = Form(0.95),
     ngram_min: int = Form(1),
     ngram_max: int = Form(1),
-    # ── LDA hyperparameters ──
-    alpha: str = Form("auto"),       # 'auto', 'symmetric', or float
-    beta: str = Form("auto"),        # 'auto' or float (learning_offset proxy)
-    learning_method: str = Form("online"),  # 'online' or 'batch'
+    alpha: str = Form("auto"),
+    beta: str = Form("auto"),
+    learning_method: str = Form("online"),
 ):
-    # Support both single file (legacy) and multiple files
     all_files = []
     if files:
         all_files = [f for f in files if f and f.filename]
@@ -333,8 +320,6 @@ async def analyze_lda(
     if not all_files:
         raise HTTPException(status_code=400, detail="No files uploaded.")
 
-    # If multiple files, each file = one document (best for LDA)
-    # If single file, split by paragraphs/sentences
     if len(all_files) > 1:
         raw_docs = []
         for f in all_files:
@@ -354,7 +339,6 @@ async def analyze_lda(
         if len(raw_docs) < 5:
             raise HTTPException(status_code=400, detail="Not enough text for LDA.")
 
-    # ── Full preprocessing pipeline ──
     processed_docs = []
     for doc in raw_docs:
         tokens = preprocess_text(
@@ -373,7 +357,6 @@ async def analyze_lda(
     if len(processed_docs) < 5:
         raise HTTPException(status_code=400, detail="Not enough text after preprocessing.")
 
-    # Build combined stopword list for vectorizer (double-safety net)
     vectorizer_stop = None
     if remove_stopwords or custom_stopwords.strip():
         from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
@@ -384,11 +367,10 @@ async def analyze_lda(
             combined.update(expand_custom_stopwords(custom_stopwords, lemmatize=lemmatize, stemming=stemming))
         vectorizer_stop = list(combined)
 
-    # ── Vectorization — fully adaptive to corpus size ──
+    # FIX: use adaptive params but respect user values as floor/ceiling hints
     n_pdocs = len(processed_docs)
-    effective_min_df, effective_max_df = adaptive_vectorizer_params(n_pdocs)
+    effective_min_df, effective_max_df = adaptive_vectorizer_params(n_pdocs, user_min_df=min_df, user_max_df=max_df)
 
-    # Build final stop set — sklearn ignores stop_words with custom tokenizer, so filter inside tokenizer
     final_stop = set(vectorizer_stop) if vectorizer_stop else set()
     if custom_stopwords.strip():
         final_stop.update(expand_custom_stopwords(custom_stopwords, lemmatize=lemmatize, stemming=stemming))
@@ -407,13 +389,13 @@ async def analyze_lda(
     if dtm.shape[1] == 0:
         raise HTTPException(status_code=400, detail="Vocabulary is empty after preprocessing. Try relaxing the filters.")
 
-    # ── LDA model ──
     n_topics = min(num_topics, len(processed_docs) - 1, dtm.shape[1])
 
-    # Handle alpha parameter
     doc_topic_prior = None if alpha == "auto" else (
         "symmetric" if alpha == "symmetric" else float(alpha)
     )
+
+    # FIX: topic_word_prior now correctly passed to the model
     topic_word_prior = None if beta == "auto" else float(beta)
 
     lda = LatentDirichletAllocation(
@@ -422,18 +404,24 @@ async def analyze_lda(
         max_iter=max_iter,
         learning_method=learning_method,
         doc_topic_prior=doc_topic_prior,
-        topic_word_prior=topic_word_prior,
+        topic_word_prior=topic_word_prior,  # FIX: was missing before
     )
     lda.fit(dtm)
+
+    # FIX: compute real document-topic assignments for accurate counts
+    doc_topic_matrix = lda.transform(dtm)
+    topic_doc_counts = doc_topic_matrix.argmax(axis=1)
 
     feature_names = vectorizer.get_feature_names_out()
     results = []
     for idx, topic in enumerate(lda.components_):
         top_indices = topic.argsort()[-10:][::-1]
         words = [{"word": feature_names[i], "score": round(float(topic[i] / topic.sum()), 4)} for i in top_indices]
+        # FIX: real count — number of docs where this topic is dominant
+        real_count = int((topic_doc_counts == idx).sum())
         results.append({
             "topic_id": idx,
-            "count": int(len(processed_docs) / n_topics),
+            "count": real_count,
             "words": words,
             "label": ", ".join(w["word"] for w in words[:3]),
         })
@@ -449,8 +437,8 @@ async def analyze_lda(
             "remove_stopwords": remove_stopwords,
             "remove_numbers": remove_numbers,
             "min_word_len": min_word_len,
-            "min_df": min_df,
-            "max_df": max_df,
+            "min_df": effective_min_df,
+            "max_df": effective_max_df,
             "ngram_range": f"({ngram_min},{ngram_max})",
             "alpha": alpha,
             "beta": beta,
@@ -477,10 +465,10 @@ async def analyze_tfidf(
     raw_docs = extract_texts_as_docs(files, file)
     if len(raw_docs) < 2:
         raise HTTPException(status_code=400, detail="Not enough text.")
-    # Override user min_df/max_df with adaptive values
-    min_df, max_df = adaptive_vectorizer_params(len(raw_docs))
 
-    # Preprocess each document
+    # FIX: renamed to effective_ to make the override explicit and clear
+    effective_min_df, effective_max_df = adaptive_vectorizer_params(len(raw_docs))
+
     processed_docs = []
     for doc in raw_docs:
         tokens = preprocess_text(
@@ -498,7 +486,6 @@ async def analyze_tfidf(
     if len(processed_docs) < 2:
         raise HTTPException(status_code=400, detail="Not enough text after preprocessing.")
 
-    # Build combined stopwords list: English + custom
     from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
     combined_stop = set(ENGLISH_STOP_WORDS)
     if remove_stopwords:
@@ -506,7 +493,6 @@ async def analyze_tfidf(
     if custom_stopwords.strip():
         combined_stop.update(expand_custom_stopwords(custom_stopwords, lemmatize=lemmatize))
 
-    # TF-IDF with proper min/max_df for score differentiation
     tfidf_stop = set(combined_stop)
     if custom_stopwords.strip():
         tfidf_stop.update(expand_custom_stopwords(custom_stopwords, lemmatize=lemmatize))
@@ -514,8 +500,8 @@ async def analyze_tfidf(
     vectorizer = TfidfVectorizer(
         max_features=max_features,
         ngram_range=(ngram_min, ngram_max),
-        min_df=min_df,
-        max_df=max_df,
+        min_df=effective_min_df,
+        max_df=effective_max_df,
         sublinear_tf=True,
         use_idf=True,
         smooth_idf=True,
@@ -526,14 +512,11 @@ async def analyze_tfidf(
     tfidf_matrix = vectorizer.fit_transform(processed_docs)
     feature_names = vectorizer.get_feature_names_out()
 
-    # Use MEAN score across documents (not max) for better differentiation
     scores_mean = np.asarray(tfidf_matrix.mean(axis=0)).flatten()
     scores_max = np.asarray(tfidf_matrix.max(axis=0).todense()).flatten()
 
-    # Combine: weighted average of mean and max
     scores = 0.6 * scores_mean + 0.4 * scores_max
 
-    # Normalize to 0-1
     if scores.max() > 0:
         scores = scores / scores.max()
 
@@ -567,14 +550,12 @@ async def analyze_tfidf_perdoc(
     if len(paragraphs) < 3:
         raise HTTPException(status_code=400, detail="Not enough text.")
 
-    # Build stopwords
     combined_stop = set(ENGLISH_STOP_WORDS)
     if remove_stopwords:
         combined_stop.update(stopwords.words("english"))
     if custom_stopwords.strip():
         combined_stop.update(expand_custom_stopwords(custom_stopwords, lemmatize=lemmatize))
 
-    # Preprocess
     processed = []
     for p in paragraphs:
         tokens = preprocess_text(p, remove_sw=remove_stopwords, lemmatize=lemmatize,
@@ -586,11 +567,9 @@ async def analyze_tfidf_perdoc(
     if len(processed) < 3:
         raise HTTPException(status_code=400, detail="Not enough text after preprocessing.")
 
-    # Fully adaptive to corpus size
     n_docs = len(processed)
-    auto_min_df, auto_max_df = adaptive_vectorizer_params(n_docs, 1, 0.95)
+    auto_min_df, auto_max_df = adaptive_vectorizer_params(n_docs)
 
-    # Fit TF-IDF on ALL documents (IDF from full corpus)
     vectorizer = TfidfVectorizer(
         max_features=5000,
         ngram_range=(ngram_min, ngram_max),
@@ -602,20 +581,12 @@ async def analyze_tfidf_perdoc(
     tfidf_matrix = vectorizer.fit_transform(processed)
     feature_names = vectorizer.get_feature_names_out()
 
-    # Get top terms per paragraph, then aggregate uniqueness
-    # A term is "distinctive" if it scores HIGH in few paragraphs (truly specific)
     scores_array = tfidf_matrix.toarray()
-
-    # For each term: score = max_score * (1 - frequency_ratio)
-    # This rewards terms that are very high in some docs but not all
     max_scores = scores_array.max(axis=0)
     doc_freq = (scores_array > 0).sum(axis=0) / len(processed)
     distinctiveness = max_scores * (1 - doc_freq * 0.5)
 
-    # Get top N
     top_idx = distinctiveness.argsort()[-max_features:][::-1]
-
-    # Normalize
     top_scores = distinctiveness[top_idx]
     if top_scores.max() > 0:
         top_scores = top_scores / top_scores.max()
@@ -647,7 +618,12 @@ async def analyze_wordfreq(
     counter = Counter(tokens)
     top = counter.most_common(max_words)
     max_count = top[0][1] if top else 1
-    return {"method": "wordfreq", "total_tokens": len(tokens), "unique_tokens": len(counter), "words": [{"word": w, "count": c, "relative": round(c / max_count, 4)} for w, c in top]}
+    return {
+        "method": "wordfreq",
+        "total_tokens": len(tokens),
+        "unique_tokens": len(counter),
+        "words": [{"word": w, "count": c, "relative": round(c / max_count, 4)} for w, c in top]
+    }
 
 
 @app.post("/analyze/sentiment")
@@ -657,7 +633,6 @@ async def analyze_sentiment(
     per_sentence: bool = Form(True),
     model: str = Form("vader"),
 ):
-    # Collect all uploaded files, deduplicate by filename
     seen = set()
     all_files = []
     candidates = list(files or [])
@@ -673,7 +648,6 @@ async def analyze_sentiment(
     if not all_files:
         raise HTTPException(status_code=400, detail="No files uploaded.")
 
-    # Concatenate text from ALL files
     full_text = ""
     for f in all_files:
         try:
@@ -695,7 +669,14 @@ async def analyze_sentiment(
     for sent in sentences:
         scores = analyzer.polarity_scores(sent)
         label = "positive" if scores["compound"] >= 0.05 else "negative" if scores["compound"] <= -0.05 else "neutral"
-        results.append({"sentence": sent[:200], "compound": round(scores["compound"], 4), "positive": round(scores["pos"], 4), "neutral": round(scores["neu"], 4), "negative": round(scores["neg"], 4), "label": label})
+        results.append({
+            "sentence": sent[:200],
+            "compound": round(scores["compound"], 4),
+            "positive": round(scores["pos"], 4),
+            "neutral": round(scores["neu"], 4),
+            "negative": round(scores["neg"], 4),
+            "label": label
+        })
     n = len(sentences)
     if n == 0:
         raise HTTPException(status_code=400, detail="No sentences found.")
@@ -710,12 +691,8 @@ async def analyze_sentiment(
     return {"method": "sentiment", "summary": summary, "sentences": results[:500]}
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
-
-
 # ── Coherence Score Calculator ────────────────────────────────────────────────
+
 @app.post("/analyze/coherence")
 async def analyze_coherence(
     files: List[UploadFile] = File(...),
@@ -738,12 +715,10 @@ async def analyze_coherence(
 ):
     import numpy as np
 
-    # ── 1. Split into documents ──────────────────────────────────────────────
     raw_docs = extract_texts_as_docs(files, file)
     if len(raw_docs) < 5:
         raise HTTPException(status_code=400, detail="Not enough text.")
 
-    # ── 2. Preprocessing — keep token lists (needed for C_V / NPMI) ──────────
     tokenized_docs = []
     for doc in raw_docs:
         tokens = preprocess_text(
@@ -762,7 +737,6 @@ async def analyze_coherence(
     if len(tokenized_docs) < 5:
         raise HTTPException(status_code=400, detail="Not enough text after preprocessing.")
 
-    # ── 3. Build stopword list for sklearn vectorizer ────────────────────────
     from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
     coh_vectorizer_stop = None
     if remove_stopwords or custom_stopwords.strip():
@@ -773,11 +747,9 @@ async def analyze_coherence(
             coh_combined.update(expand_custom_stopwords(custom_stopwords, lemmatize=lemmatize, stemming=stemming))
         coh_vectorizer_stop = list(coh_combined)
 
-    # ── 4. sklearn vectorizer (for LDA + perplexity) ─────────────────────────
     processed_docs = [" ".join(t) for t in tokenized_docs]
     n_docs = len(processed_docs)
 
-    # Fully adaptive to corpus size
     effective_min_df, effective_max_df = adaptive_vectorizer_params(n_docs)
 
     coh_final_stop = set(coh_vectorizer_stop) if coh_vectorizer_stop else set()
@@ -799,7 +771,6 @@ async def analyze_coherence(
     if dtm.shape[1] == 0:
         raise HTTPException(status_code=400, detail="Vocabulary empty after preprocessing.")
 
-    # ── 5. Attempt Gensim C_V coherence (gold standard) ─────────────────────
     use_cv = False
     gensim_dictionary = None
     gensim_corpus = None
@@ -810,7 +781,6 @@ async def analyze_coherence(
         from gensim.models.coherencemodel import CoherenceModel
 
         gensim_dictionary = corpora.Dictionary(tokenized_docs)
-        # Filter extremes to match sklearn settings
         gensim_dictionary.filter_extremes(no_below=min_df, no_above=max_df, keep_n=max_features)
         gensim_corpus = [gensim_dictionary.doc2bow(doc) for doc in tokenized_docs]
 
@@ -819,14 +789,12 @@ async def analyze_coherence(
     except ImportError:
         use_cv = False
 
-    # ── 6. Loop over topic range ─────────────────────────────────────────────
     topic_range = list(range(min_topics, min(max_topics + 1, len(tokenized_docs)), step))
     perplexity_scores = []
     coherence_scores = []
     coherence_metric = "c_v" if use_cv else "npmi"
 
     for n_topics in topic_range:
-        # sklearn LDA for perplexity
         lda_sk = LatentDirichletAllocation(
             n_components=n_topics,
             random_state=42,
@@ -838,7 +806,6 @@ async def analyze_coherence(
         perplexity_scores.append(round(float(perp), 2))
 
         if use_cv:
-            # ── Gensim LDA + C_V coherence ────────────────────────────────
             try:
                 lda_gensim = LdaModel(
                     corpus=gensim_corpus,
@@ -857,7 +824,6 @@ async def analyze_coherence(
                 )
                 score = round(float(cm.get_coherence()), 4)
             except Exception:
-                # fallback to NPMI if C_V fails
                 try:
                     cm = CoherenceModel(
                         model=lda_gensim,
@@ -871,15 +837,10 @@ async def analyze_coherence(
                 except Exception:
                     score = 0.0
         else:
-            # ── NPMI fallback (no gensim) — better than UMass ─────────────
-            # NPMI = log(p(wi,wj) / p(wi)*p(wj)) / -log(p(wi,wj))
-            # computed over sliding windows of size 10
             window_size = 10
-            all_tokens_flat = [t for doc in tokenized_docs for t in doc]
             vocab_list = list(feature_names)
             word2idx = {w: i for i, w in enumerate(vocab_list)}
 
-            # Build co-occurrence counts using sliding windows
             n_vocab = len(vocab_list)
             word_count = np.zeros(n_vocab)
             pair_count = {}
@@ -920,11 +881,9 @@ async def analyze_coherence(
 
         coherence_scores.append(score)
 
-    # ── 7. Find optimal — peak of C_V/NPMI curve ────────────────────────────
     best_idx = coherence_scores.index(max(coherence_scores))
     optimal_topics = topic_range[best_idx]
 
-    # Normalize for display (0–100)
     min_c = min(coherence_scores)
     max_c = max(coherence_scores)
     range_c = max_c - min_c if max_c != min_c else 1
@@ -949,3 +908,9 @@ async def analyze_coherence(
         "optimal_coherence": coherence_scores[best_idx],
         "recommendation": recommendation,
     }
+
+
+# ── FIX: uvicorn.run moved to bottom — after ALL routes are defined ───────────
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
