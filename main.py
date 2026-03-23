@@ -266,6 +266,8 @@ async def analyze_bertopic(
     language: str = Form("english"),
     reduce_outliers: bool = Form(True),
     engine: str = Form("local"),
+    custom_stopwords: str = Form(""),
+    lemmatize: bool = Form(False),
 ):
     seen = set()
     all_files = []
@@ -282,7 +284,32 @@ async def analyze_bertopic(
             full_text += extract_text(f) + "\n"
         except Exception:
             pass
-    docs = [s.strip() for s in sent_tokenize(full_text) if len(s.strip()) > 20]
+
+    # Always strip URLs, www references, and standalone numbers from BERTopic docs
+    import re as _re
+    _url_re = _re.compile(r'https?://\S+|www\.\S+', _re.IGNORECASE)
+    _num_re = _re.compile(r'\b\d+\b')
+
+    def _clean_bertopic_doc(text: str) -> str:
+        text = _url_re.sub(' ', text)
+        text = _num_re.sub(' ', text)
+        # Optionally apply lemmatization
+        if lemmatize:
+            tokens = word_tokenize(text.lower())
+            lem = WordNetLemmatizer()
+            tokens = [lem.lemmatize(t) for t in tokens if t.isalpha() or t in ('.', ',', '!', '?')]
+            text = ' '.join(tokens)
+        return text.strip()
+
+    docs = [_clean_bertopic_doc(s.strip()) for s in sent_tokenize(full_text) if len(s.strip()) > 20]
+    docs = [d for d in docs if len(d) > 10]
+
+    # Apply custom stopwords by filtering them out at the sentence level
+    if custom_stopwords.strip():
+        custom_set = expand_custom_stopwords(custom_stopwords, lemmatize=lemmatize)
+        _cust_re = _re.compile(r'\b(' + '|'.join(_re.escape(w) for w in custom_set) + r')\b', _re.IGNORECASE)
+        docs = [_cust_re.sub(' ', d).strip() for d in docs]
+
     if len(docs) < 5:
         raise HTTPException(status_code=400, detail="Not enough text.")
     if engine == "colab":
