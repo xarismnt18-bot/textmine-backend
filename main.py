@@ -166,7 +166,10 @@ def preprocess_text(
 
     if lemmatize:
         lem = WordNetLemmatizer()
-        tokens = [lem.lemmatize(t) for t in tokens]
+        def _lem_best(word):
+            forms = [lem.lemmatize(word, pos='n'), lem.lemmatize(word, pos='v'), lem.lemmatize(word, pos='a')]
+            return min(forms, key=len)
+        tokens = [_lem_best(t) for t in tokens]
     elif stemming:
         stemmer = PorterStemmer()
         tokens = [stemmer.stem(t) for t in tokens]
@@ -187,7 +190,10 @@ def clean_tokens(text, remove_stopwords=True, lemmatize=False):
         tokens = [t for t in tokens if t not in stop]
     if lemmatize:
         lem = WordNetLemmatizer()
-        tokens = [lem.lemmatize(t) for t in tokens]
+        def _lem_best(word):
+            forms = [lem.lemmatize(word, pos='n'), lem.lemmatize(word, pos='v'), lem.lemmatize(word, pos='a')]
+            return min(forms, key=len)
+        tokens = [_lem_best(t) for t in tokens]
     return tokens
 
 
@@ -297,7 +303,10 @@ async def analyze_bertopic(
         if lemmatize:
             tokens = word_tokenize(text.lower())
             lem = WordNetLemmatizer()
-            tokens = [lem.lemmatize(t) for t in tokens if t.isalpha() or t in ('.', ',', '!', '?')]
+            def _lem_best(word):
+                forms = [lem.lemmatize(word, pos='n'), lem.lemmatize(word, pos='v'), lem.lemmatize(word, pos='a')]
+                return min(forms, key=len)
+            tokens = [_lem_best(t) if t.isalpha() else t for t in tokens if t.isalpha() or t in ('.', ',', '!', '?')]
             text = ' '.join(tokens)
         return text.strip()
 
