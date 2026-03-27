@@ -1,8 +1,8 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn, io, os
 import requests
-
+from anthropic import Anthropic
 import PyPDF2, openpyxl
 import nltk
 from nltk.corpus import stopwords
@@ -29,6 +29,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+anthropic_client = Anthropic()
+
+@app.post("/ai/evaluate")
+async def ai_evaluate(request: Request):
+    body = await request.json()
+    response = anthropic_client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1000,
+        system=body.get("system", ""),
+        messages=body.get("messages", [])
+    )
+    return {"content": response.content[0].text}
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
