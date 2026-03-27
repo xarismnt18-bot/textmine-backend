@@ -29,7 +29,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-anthropic_client = Anthropic()
+
+anthropic_client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
 @app.post("/ai/evaluate")
 async def ai_evaluate(request: Request):
