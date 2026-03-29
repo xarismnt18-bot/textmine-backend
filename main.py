@@ -816,16 +816,15 @@ async def analyze_coherence(
     processed_docs = [" ".join(t) for t in tokenized_docs]
     n_docs = len(processed_docs)
 
-    effective_min_df, effective_max_df = adaptive_vectorizer_params(n_docs)
-
+    # Use fixed min_df=2 for coherence — adaptive params collapse vocab too aggressively
     coh_final_stop = set(coh_vectorizer_stop) if coh_vectorizer_stop else set()
     if custom_stopwords.strip():
         coh_final_stop.update(expand_custom_stopwords(custom_stopwords, lemmatize=lemmatize, stemming=stemming))
 
     vectorizer = CountVectorizer(
         max_features=max_features,
-        min_df=effective_min_df,
-        max_df=effective_max_df,
+        min_df=2,
+        max_df=0.95,
         ngram_range=(ngram_min, ngram_max),
         tokenizer=_make_tokenizer(coh_final_stop),
         preprocessor=lambda x: x,
