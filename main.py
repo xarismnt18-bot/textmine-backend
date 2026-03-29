@@ -44,15 +44,39 @@ async def ai_evaluate(request: Request):
     return {"content": response.content[0].text}
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+def clean_raw_text(text: str) -> str:
+    """
+    Universal post-extraction cleaner applied to all file types.
+    Removes HTML tags, skips header-only lines (e.g. 'review'),
+    collapses whitespace, and drops lines that are too short to be useful.
+    """
+    # Remove HTML tags — catches <br />, <br>, <p>, <div>, etc.
+    text = re.sub(r'<[^>]+>', ' ', text)
+    # Remove lines that are purely a known header word
+    _header_words = {'review', 'reviews', 'text', 'comment', 'comments',
+                     'description', 'body', 'content', 'feedback'}
+    lines = text.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        stripped = line.strip()
+        # Drop lines that are just a single header keyword
+        if stripped.lower() in _header_words:
+            continue
+        # Drop very short lines (stray punctuation, artefacts)
+        if len(stripped) < 10:
+            continue
+        # Collapse multiple spaces within the line
+        cleaned_lines.append(re.sub(r' {2,}', ' ', stripped))
+    return '\n'.join(cleaned_lines)
 
 def extract_text(file: UploadFile) -> str:
     content = file.file.read()
     name = file.filename.lower()
     if name.endswith(".txt"):
-        return content.decode("utf-8", errors="ignore")
+        raw = content.decode("utf-8", errors="ignore")
     elif name.endswith(".pdf"):
         reader = PyPDF2.PdfReader(io.BytesIO(content))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
+        raw = "\n".join(page.extract_text() or "" for page in reader.pages)
     elif name.endswith(".xlsx"):
         wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
         texts = []
@@ -61,9 +85,10 @@ def extract_text(file: UploadFile) -> str:
                 row_text = " ".join(str(c) for c in row if c is not None)
                 if row_text.strip():
                     texts.append(row_text)
-        return "\n".join(texts)
-    raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.filename}")
-
+        raw = "\n".join(texts)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.filename}")
+    return clean_raw_text(raw)
 
 def extract_texts_as_docs(files_list: list, single_file=None) -> list:
     """
