@@ -836,25 +836,17 @@ async def analyze_coherence(
     if dtm.shape[1] == 0:
         raise HTTPException(status_code=400, detail="Vocabulary empty after preprocessing.")
 
-    use_cv = False
-    gensim_dictionary = None
-    gensim_corpus = None
     try:
-        import gensim
         import gensim.corpora as corpora
         from gensim.models.coherencemodel import CoherenceModel
-
-        gensim_dictionary = corpora.Dictionary(tokenized_docs)
-        # Use fixed filter_extremes for coherence — matches vectorizer params
-        gensim_dictionary.filter_extremes(no_below=2, no_above=0.95, keep_n=max_features)
-        gensim_corpus = [gensim_dictionary.doc2bow(doc) for doc in tokenized_docs]
-
-        if len(gensim_dictionary) >= 10:
-            use_cv = True
-        else:
-            use_cv = False
     except ImportError:
-        use_cv = False
+        raise HTTPException(status_code=500, detail="Gensim is not installed. Add gensim to requirements.txt.")
+
+    gensim_dictionary = corpora.Dictionary(tokenized_docs)
+    gensim_dictionary.filter_extremes(no_below=2, no_above=0.95, keep_n=max_features)
+
+    if len(gensim_dictionary) < 10:
+        raise HTTPException(status_code=400, detail="Vocabulary too small for C_V coherence. Upload a larger corpus (500+ documents with longer text).")
 
     topic_range = list(range(min_topics, min(max_topics + 1, len(tokenized_docs)), step))
     perplexity_scores = []
