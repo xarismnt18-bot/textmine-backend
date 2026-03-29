@@ -90,7 +90,14 @@ def extract_texts_as_docs(files_list: list, single_file=None) -> list:
                 if hasattr(f.file, 'seek'):
                     f.file.seek(0)
                 t = extract_text(f).strip()
-                if len(t) > 20:
+                if not t:
+                    continue
+                # For line-per-document files (TXT with one review per line),
+                # split into individual documents rather than treating whole file as one.
+                lines = [l.strip() for l in t.split('\n') if len(l.strip()) > 20]
+                if len(lines) >= 5:
+                    docs.extend(lines)
+                elif len(t) > 20:
                     docs.append(t)
             except Exception:
                 pass
