@@ -843,7 +843,6 @@ async def analyze_coherence(
     try:
         import gensim
         import gensim.corpora as corpora
-        from gensim.models import LdaModel
         from gensim.models.coherencemodel import CoherenceModel
 
         gensim_dictionary = corpora.Dictionary(tokenized_docs)
@@ -864,7 +863,7 @@ async def analyze_coherence(
         lda_sk = LatentDirichletAllocation(
             n_components=n_topics,
             random_state=42,
-            max_iter=max_iter,
+            max_iter=10,  # capped at 10 for Render speed; sufficient for coherence ranking
             learning_method="online",
         )
         lda_sk.fit(dtm)
@@ -873,16 +872,13 @@ async def analyze_coherence(
 
         if use_cv:
             try:
-                lda_gensim = LdaModel(
-                    corpus=gensim_corpus,
-                    num_topics=n_topics,
-                    id2word=gensim_dictionary,
-                    passes=5,
-                    random_state=42,
-                    alpha="auto",
-                )
+                # Extract top words directly from sklearn LDA — no second Gensim LDA needed
+                top_words = []
+                for topic in lda_sk.components_:
+                    top_idx = topic.argsort()[-10:][::-1]
+                    top_words.append([feature_names[i] for i in top_idx])
                 cm = CoherenceModel(
-                    model=lda_gensim,
+                    topics=top_words,
                     texts=tokenized_docs,
                     dictionary=gensim_dictionary,
                     coherence="c_v",
@@ -891,8 +887,12 @@ async def analyze_coherence(
                 score = round(float(cm.get_coherence()), 4)
             except Exception:
                 try:
+                    top_words = []
+                    for topic in lda_sk.components_:
+                        top_idx = topic.argsort()[-10:][::-1]
+                        top_words.append([feature_names[i] for i in top_idx])
                     cm = CoherenceModel(
-                        model=lda_gensim,
+                        topics=top_words,
                         texts=tokenized_docs,
                         dictionary=gensim_dictionary,
                         coherence="c_npmi",
