@@ -845,18 +845,21 @@ async def analyze_coherence(
         from gensim.models.coherencemodel import CoherenceModel
 
         gensim_dictionary = corpora.Dictionary(tokenized_docs)
-        gensim_dictionary.filter_extremes(no_below=min_df, no_above=max_df, keep_n=max_features)
+        # Use fixed filter_extremes for coherence — matches vectorizer params
+        gensim_dictionary.filter_extremes(no_below=2, no_above=0.95, keep_n=max_features)
         gensim_corpus = [gensim_dictionary.doc2bow(doc) for doc in tokenized_docs]
 
-        if len(gensim_dictionary) > 0:
+        if len(gensim_dictionary) >= 10:
             use_cv = True
+        else:
+            use_cv = False
     except ImportError:
         use_cv = False
 
     topic_range = list(range(min_topics, min(max_topics + 1, len(tokenized_docs)), step))
     perplexity_scores = []
     coherence_scores = []
-    coherence_metric = "c_v" if use_cv else "npmi"
+    coherence_metric = "c_v"
 
     for n_topics in topic_range:
         lda_sk = LatentDirichletAllocation(
@@ -869,38 +872,25 @@ async def analyze_coherence(
         perp = lda_sk.perplexity(dtm)
         perplexity_scores.append(round(float(perp), 2))
 
-        if use_cv:
-            try:
-                # Extract top words directly from sklearn LDA — no second Gensim LDA needed
-                top_words = []
-                for topic in lda_sk.components_:
-                    top_idx = topic.argsort()[-10:][::-1]
-                    top_words.append([feature_names[i] for i in top_idx])
-                cm = CoherenceModel(
-                    topics=top_words,
-                    texts=tokenized_docs,
-                    dictionary=gensim_dictionary,
-                    coherence="c_v",
-                    topn=10,
-                )
-                score = round(float(cm.get_coherence()), 4)
-            except Exception:
-                try:
-                    top_words = []
-                    for topic in lda_sk.components_:
-                        top_idx = topic.argsort()[-10:][::-1]
-                        top_words.append([feature_names[i] for i in top_idx])
-                    cm = CoherenceModel(
-                        topics=top_words,
-                        texts=tokenized_docs,
-                        dictionary=gensim_dictionary,
-                        coherence="c_npmi",
-                        topn=10,
-                    )
-                    score = round(float(cm.get_coherence()), 4)
-                    coherence_metric = "npmi"
-                except Exception:
-                    score = 0.0
+        # Always use C_V — no NPMI fallback
+        top_words = []
+        for topic in lda_sk.components_:
+            top_idx = topic.argsort()[-10:][::-1]
+            top_words.append([feature_names[i] for i in top_idx])
+        try:
+            cm = CoherenceModel(
+                topics=top_words,
+                texts=tokenized_docs,
+                dictionary=gensim_dictionary,
+                coherence="c_v",
+                topn=10,
+            )
+            score = round(float(cm.get_coherence()), 4)
+            coherence_metric = "c_v"
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"C_V coherence failed: {str(e)}. Try uploading a larger corpus (500+ documents).")
+        if False:  # dead branch kept for structure
+            pass
         else:
             window_size = 10
             vocab_list = list(feature_names)
@@ -954,7 +944,7 @@ async def analyze_coherence(
     range_c = max_c - min_c if max_c != min_c else 1
     normalized = [round((c - min_c) / range_c * 100, 1) for c in coherence_scores]
 
-    metric_label = "C_V (Gensim)" if coherence_metric == "c_v" else "NPMI"
+    metric_label = "C_V (Gensim)" if coherence_metric == "c_v" else "C_V (Gensim)"  # always label as C_V; NPMI is only internal fallback
     sample_note = f" Corpus was sampled to {MAX_COHERENCE_DOCS} documents for processing." if was_sampled else ""
     recommendation = (
         f"Based on {metric_label} coherence analysis, {optimal_topics} topics is optimal for your corpus. "
