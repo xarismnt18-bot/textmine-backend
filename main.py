@@ -778,7 +778,7 @@ async def analyze_coherence(
     # Cap corpus at 2000 docs to stay within Render free-tier memory/time limits.
     # Coherence on a representative sample produces the same optimal K
     # as on the full corpus for corpora above ~500 documents.
-    MAX_COHERENCE_DOCS = 2000
+    MAX_COHERENCE_DOCS = 500
     was_sampled = False
     if len(raw_docs) > MAX_COHERENCE_DOCS:
         random.seed(42)
@@ -822,7 +822,7 @@ async def analyze_coherence(
         coh_final_stop.update(expand_custom_stopwords(custom_stopwords, lemmatize=lemmatize, stemming=stemming))
 
     vectorizer = CountVectorizer(
-        max_features=max_features,
+        max_features=min(max_features, 500),  # cap at 500 for Render memory
         min_df=2,
         max_df=0.95,
         ngram_range=(ngram_min, ngram_max),
@@ -857,7 +857,7 @@ async def analyze_coherence(
         lda_sk = LatentDirichletAllocation(
             n_components=n_topics,
             random_state=42,
-            max_iter=10,  # capped at 10 for Render speed; sufficient for coherence ranking
+            max_iter=5,  # capped at 5 for Render free-tier memory; sufficient for coherence ranking
             learning_method="online",
         )
         lda_sk.fit(dtm)
