@@ -36,7 +36,7 @@ anthropic_client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 async def ai_evaluate(request: Request):
     body = await request.json()
     response = anthropic_client.messages.create(
-        model="claude-sonnet-4-20250514",
+         model="claude-sonnet-4-6",
         max_tokens=1000,
         system=body.get("system", ""),
         messages=body.get("messages", [])
