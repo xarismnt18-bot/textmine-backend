@@ -51,6 +51,28 @@ Your Colab service should accept JSON like:
 
 And return a BERTopic-style payload (topics, counts, top words).
 
+## AI Evaluate endpoint
+
+`POST /ai/evaluate` proxies to the Anthropic API and requires a shared-secret header
+so it can't be abused by anyone who finds the URL (it was previously wide open).
+
+Set both of these environment variables before starting the backend:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+export BACKEND_API_KEY="<a random secret you choose>"
+```
+
+Callers must send the same secret back as a header:
+
+```
+X-API-Key: <the same BACKEND_API_KEY value>
+```
+
+Requests without a matching header receive `401 Unauthorized`. If `BACKEND_API_KEY`
+isn't set on the server at all, the endpoint returns `503` rather than silently
+allowing unauthenticated access.
+
 
 ## Deploy on Render
 

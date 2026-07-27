@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn, io, os
 import requests
@@ -25,18 +25,27 @@ app = FastAPI(title="TextMine API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 anthropic_client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
+# ── FIX: /ai/evaluate was completely unauthenticated — anyone who found the URL
+# could burn the ANTHROPIC_API_KEY budget with arbitrary system/messages payloads.
+# Require a shared-secret header that only the frontend (configured via env var) knows.
+BACKEND_API_KEY = os.environ.get("BACKEND_API_KEY")
+
 @app.post("/ai/evaluate")
-async def ai_evaluate(request: Request):
+async def ai_evaluate(request: Request, x_api_key: Optional[str] = Header(None)):
+    if not BACKEND_API_KEY:
+        raise HTTPException(status_code=503, detail="AI evaluate endpoint is not configured (BACKEND_API_KEY missing).")
+    if x_api_key != BACKEND_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key header.")
     body = await request.json()
     response = anthropic_client.messages.create(
-         model="claude-sonnet-4-6",
+        model="claude-sonnet-4-6",
         max_tokens=1000,
         system=body.get("system", ""),
         messages=body.get("messages", [])
@@ -116,6 +125,10 @@ def extract_texts_as_docs(files_list: list, single_file=None) -> list:
 def adaptive_vectorizer_params(n_docs: int, user_min_df: int = 2, user_max_df: float = 0.95):
     """
     Continuously adaptive min_df and max_df — scales smoothly with ANY corpus size.
+    Used as the DEFAULT (when the caller hasn't changed the UI sliders from their
+    out-of-the-box defaults of min_df=2 / max_df=0.95). If the user explicitly picks
+    different values, those are honored directly — clamped to safe bounds so they
+    can never produce an empty vocabulary.
 
     min_df = sqrt(n_docs): word must appear in sqrt(n) docs to be statistically meaningful
       n=3→1, n=5→2, n=10→3, n=30→5, n=100→10, n=154→12, n=500→22
@@ -124,12 +137,27 @@ def adaptive_vectorizer_params(n_docs: int, user_min_df: int = 2, user_max_df: f
       n=3→0.99, n=10→0.96, n=50→0.91, n=154→0.88, n=500→0.85
     """
     import math
+
     if n_docs < 3:
-        return 1, 0.99
-    effective_min_df = max(1, int(math.sqrt(n_docs)))
-    scale = (math.log(n_docs) - math.log(3)) / (math.log(500) - math.log(3))
-    effective_max_df = round(max(0.85, min(0.99, 0.99 - 0.14 * scale)), 2)
-    return effective_min_df, effective_max_df
+        auto_min_df, auto_max_df = 1, 0.99
+    else:
+        auto_min_df = max(1, int(math.sqrt(n_docs)))
+        scale = (math.log(n_docs) - math.log(3)) / (math.log(500) - math.log(3))
+        auto_max_df = round(max(0.85, min(0.99, 0.99 - 0.14 * scale)), 2)
+
+    # FIX: previously user_min_df/user_max_df were accepted but never used — the
+    # sliders in the UI had zero effect. Now: if the caller left the sliders at the
+    # form defaults (2 / 0.95) we keep the smart adaptive behavior; otherwise we
+    # honor the user's explicit choice, clamped to values that can't break the
+    # vectorizer for this corpus size.
+    effective_min_df = user_min_df if user_min_df != 2 else auto_min_df
+    effective_max_df = user_max_df if abs(user_max_df - 0.95) > 1e-9 else auto_max_df
+
+    max_allowed_min_df = max(1, n_docs - 1)
+    effective_min_df = max(1, min(int(effective_min_df), max_allowed_min_df))
+    effective_max_df = max(effective_min_df / n_docs if n_docs else 0.01, min(0.99, float(effective_max_df)))
+
+    return effective_min_df, round(effective_max_df, 2)
 
 
 def expand_custom_stopwords(custom_stopwords: str, lemmatize: bool = False, stemming: bool = False) -> set:
@@ -367,32 +395,12 @@ async def analyze_lda(
     beta: str = Form("auto"),
     learning_method: str = Form("online"),
 ):
-    all_files = []
-    if files:
-        all_files = [f for f in files if f and f.filename]
-    if file and file.filename:
-        all_files.append(file)
-    if not all_files:
-        raise HTTPException(status_code=400, detail="No files uploaded.")
-
-    if len(all_files) > 1:
-        raw_docs = []
-        for f in all_files:
-            try:
-                t = extract_text(f).strip()
-                if len(t) > 20:
-                    raw_docs.append(t)
-            except Exception:
-                pass
-        if len(raw_docs) < 3:
-            raise HTTPException(status_code=400, detail="Not enough text across files.")
-    else:
-        text = extract_text(all_files[0])
-        raw_docs = [p.strip() for p in text.split('\n') if len(p.strip()) > 30]
-        if len(raw_docs) < 5:
-            raw_docs = [s.strip() for s in sent_tokenize(text) if len(s.strip()) > 20]
-        if len(raw_docs) < 5:
-            raise HTTPException(status_code=400, detail="Not enough text for LDA.")
+    # FIX: this used to duplicate extract_texts_as_docs() with a slightly different
+    # (and inconsistent) fallback threshold. Now reuses the single shared helper so
+    # all endpoints split documents identically.
+    raw_docs = extract_texts_as_docs(files, file)
+    if len(raw_docs) < 5:
+        raise HTTPException(status_code=400, detail="Not enough text for LDA.")
 
     processed_docs = []
     for doc in raw_docs:
@@ -444,7 +452,9 @@ async def analyze_lda(
     if dtm.shape[1] == 0:
         raise HTTPException(status_code=400, detail="Vocabulary is empty after preprocessing. Try relaxing the filters.")
 
-    n_topics = min(num_topics, len(processed_docs) - 1, dtm.shape[1])
+    # FIX: floor at 1 — previously this could evaluate to 0 (or negative) on tiny
+    # corpora and crash LatentDirichletAllocation with n_components=0.
+    n_topics = max(1, min(num_topics, len(processed_docs) - 1, dtm.shape[1]))
 
     doc_topic_prior = None if alpha == "auto" else (
         "symmetric" if alpha == "symmetric" else float(alpha)
@@ -521,8 +531,11 @@ async def analyze_tfidf(
     if len(raw_docs) < 2:
         raise HTTPException(status_code=400, detail="Not enough text.")
 
-    # FIX: renamed to effective_ to make the override explicit and clear
-    effective_min_df, effective_max_df = adaptive_vectorizer_params(len(raw_docs))
+    # FIX: user_min_df/user_max_df are now actually forwarded (previously dropped
+    # entirely, so the Min/Max Doc Frequency sliders in the TF-IDF UI did nothing).
+    effective_min_df, effective_max_df = adaptive_vectorizer_params(
+        len(raw_docs), user_min_df=min_df, user_max_df=max_df
+    )
 
     processed_docs = []
     for doc in raw_docs:
@@ -717,6 +730,16 @@ async def analyze_sentiment(
     if not full_text.strip():
         raise HTTPException(status_code=400, detail="No text could be extracted from the uploaded files.")
 
+    # FIX: this backend only ever ran VADER but echoed back whatever `model` the
+    # caller sent (e.g. "roberta"), so responses could falsely claim model_used:
+    # "roberta" while actually being VADER-scored. RoBERTa is only implemented on
+    # the Colab backend — fail loudly instead of silently mislabeling results.
+    if model not in ("vader", ""):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{model}' is not supported on this backend. Only VADER ('vader') runs here — use the Colab backend (engine=colab) for RoBERTa.",
+        )
+
     analyzer = SentimentIntensityAnalyzer()
     sentences = sent_tokenize(full_text) if per_sentence else [full_text]
     sentences = [s.strip() for s in sentences if len(s.strip()) > 5]
@@ -768,7 +791,6 @@ async def analyze_coherence(
     ngram_min: int = Form(1),
     ngram_max: int = Form(1),
 ):
-    import numpy as np
     import random
 
     raw_docs = extract_texts_as_docs(files, file)
@@ -816,15 +838,27 @@ async def analyze_coherence(
     processed_docs = [" ".join(t) for t in tokenized_docs]
     n_docs = len(processed_docs)
 
-    # Use fixed min_df=2 for coherence — adaptive params collapse vocab too aggressively
+    # FIX: previously the sklearn CountVectorizer (used for perplexity/topic-words)
+    # and the gensim Dictionary (used for C_V coherence) were filtered with
+    # DIFFERENT min_df/max_df values, so the two models being "compared" in the
+    # recommendation didn't even share a vocabulary. Also, the user's min_df/max_df
+    # form inputs were silently discarded in favor of a hardcoded (2, 0.95). Now
+    # both use the same effective values, and the user's choice is respected
+    # (via adaptive_vectorizer_params, which falls back to a sane default only
+    # when the user left the sliders untouched).
+    effective_min_df, effective_max_df = adaptive_vectorizer_params(
+        n_docs, user_min_df=min_df, user_max_df=max_df
+    )
+    capped_max_features = min(max_features, 500)  # cap for Render free-tier memory
+
     coh_final_stop = set(coh_vectorizer_stop) if coh_vectorizer_stop else set()
     if custom_stopwords.strip():
         coh_final_stop.update(expand_custom_stopwords(custom_stopwords, lemmatize=lemmatize, stemming=stemming))
 
     vectorizer = CountVectorizer(
-        max_features=min(max_features, 500),  # cap at 500 for Render memory
-        min_df=2,
-        max_df=0.95,
+        max_features=capped_max_features,
+        min_df=effective_min_df,
+        max_df=effective_max_df,
         ngram_range=(ngram_min, ngram_max),
         tokenizer=_make_tokenizer(coh_final_stop),
         preprocessor=lambda x: x,
@@ -843,12 +877,24 @@ async def analyze_coherence(
         raise HTTPException(status_code=500, detail="Gensim is not installed. Add gensim to requirements.txt.")
 
     gensim_dictionary = corpora.Dictionary(tokenized_docs)
-    gensim_dictionary.filter_extremes(no_below=2, no_above=0.95, keep_n=max_features)
+    gensim_dictionary.filter_extremes(no_below=effective_min_df, no_above=effective_max_df, keep_n=capped_max_features)
 
     if len(gensim_dictionary) < 10:
         raise HTTPException(status_code=400, detail="Vocabulary too small for C_V coherence. Upload a larger corpus (500+ documents with longer text).")
 
+    # FIX: guard against an empty topic_range (e.g. min_topics >= max_topics, a
+    # non-positive step, or a corpus barely larger than min_topics). Previously
+    # this fell through to `max(coherence_scores)` on an empty list, raising an
+    # unhandled ValueError (500) instead of a clear, actionable error.
+    if step <= 0:
+        raise HTTPException(status_code=400, detail="step must be a positive integer.")
     topic_range = list(range(min_topics, min(max_topics + 1, len(tokenized_docs)), step))
+    if not topic_range:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No valid topic counts to test between min_topics={min_topics} and max_topics={max_topics} "
+                   f"for a corpus of {len(tokenized_docs)} documents. Try lowering min_topics or uploading more documents.",
+        )
     perplexity_scores = []
     coherence_scores = []
     coherence_metric = "c_v"
@@ -869,6 +915,11 @@ async def analyze_coherence(
         for topic in lda_sk.components_:
             top_idx = topic.argsort()[-10:][::-1]
             top_words.append([feature_names[i] for i in top_idx])
+        # FIX: this used to compute a real C_V score above and then *unconditionally*
+        # overwrite it with a manually-computed NPMI score via a dead `if False:
+        # ... else:` branch (the else always ran). The response labeled
+        # coherence_metric as "c_v" while the numbers were actually NPMI. Now the
+        # C_V score computed via gensim is the one actually used.
         try:
             cm = CoherenceModel(
                 topics=top_words,
@@ -878,53 +929,8 @@ async def analyze_coherence(
                 topn=10,
             )
             score = round(float(cm.get_coherence()), 4)
-            coherence_metric = "c_v"
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"C_V coherence failed: {str(e)}. Try uploading a larger corpus (500+ documents).")
-        if False:  # dead branch kept for structure
-            pass
-        else:
-            window_size = 10
-            vocab_list = list(feature_names)
-            word2idx = {w: i for i, w in enumerate(vocab_list)}
-
-            n_vocab = len(vocab_list)
-            word_count = np.zeros(n_vocab)
-            pair_count = {}
-
-            for doc_tokens in tokenized_docs:
-                idxs = [word2idx[t] for t in doc_tokens if t in word2idx]
-                for k in range(len(idxs)):
-                    word_count[idxs[k]] += 1
-                    window = idxs[max(0, k - window_size): k + window_size + 1]
-                    for m in window:
-                        if m != idxs[k]:
-                            pair = (min(idxs[k], m), max(idxs[k], m))
-                            pair_count[pair] = pair_count.get(pair, 0) + 1
-
-            total = max(sum(word_count), 1)
-
-            def npmi(wi, wj):
-                pair = (min(wi, wj), max(wi, wj))
-                co = pair_count.get(pair, 0)
-                if co == 0:
-                    return -1.0
-                p_wi = word_count[wi] / total
-                p_wj = word_count[wj] / total
-                p_co = co / total
-                pmi = np.log(p_co / (p_wi * p_wj + 1e-12))
-                npmi_val = pmi / (-np.log(p_co + 1e-12))
-                return float(npmi_val)
-
-            topic_scores = []
-            for topic in lda_sk.components_:
-                top_idx = topic.argsort()[-10:][::-1]
-                pairs = [(top_idx[i], top_idx[j])
-                         for i in range(len(top_idx))
-                         for j in range(i + 1, len(top_idx))]
-                s = np.mean([npmi(wi, wj) for wi, wj in pairs]) if pairs else 0.0
-                topic_scores.append(s)
-            score = round(float(np.mean(topic_scores)), 4)
 
         coherence_scores.append(score)
 
@@ -936,7 +942,7 @@ async def analyze_coherence(
     range_c = max_c - min_c if max_c != min_c else 1
     normalized = [round((c - min_c) / range_c * 100, 1) for c in coherence_scores]
 
-    metric_label = "C_V (Gensim)" if coherence_metric == "c_v" else "C_V (Gensim)"  # always label as C_V; NPMI is only internal fallback
+    metric_label = "C_V (Gensim)"
     sample_note = f" Corpus was sampled to {MAX_COHERENCE_DOCS} documents for processing." if was_sampled else ""
     recommendation = (
         f"Based on {metric_label} coherence analysis, {optimal_topics} topics is optimal for your corpus. "
